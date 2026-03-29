@@ -75,7 +75,8 @@ jobs:
 
           # Binaries
           cp "target/${{ matrix.target }}/release/claude-mail" "$STAGING/claude-mail"
-          cp "target/${{ matrix.target }}/release/gateway"     "$STAGING/claude-mail-gateway"
+          cp "target/${{ matrix.target }}/release/gateway"             "$STAGING/claude-mail-gateway"
+          cp "target/${{ matrix.target }}/release/claude-mail-skills" "$STAGING/claude-mail-skills"
 
           # Extras
           cp crates/gateway/claude-mail-gateway.service "$STAGING/"
@@ -93,7 +94,8 @@ jobs:
           New-Item -ItemType Directory $staging | Out-Null
 
           Copy-Item "target/${{ matrix.target }}/release/claude-mail.exe"  "$staging/claude-mail.exe"
-          Copy-Item "target/${{ matrix.target }}/release/gateway.exe"       "$staging/claude-mail-gateway.exe"
+          Copy-Item "target/${{ matrix.target }}/release/gateway.exe"             "$staging/claude-mail-gateway.exe"
+          Copy-Item "target/${{ matrix.target }}/release/claude-mail-skills.exe" "$staging/claude-mail-skills.exe"
 
           Compress-Archive -Path $staging -DestinationPath "${staging}.zip"
           echo "ASSET=${staging}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append

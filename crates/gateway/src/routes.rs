@@ -1,6 +1,7 @@
 use axum::{
+    body::Bytes,
     extract::{Path, State},
-    http::StatusCode,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
     Json,
 };
@@ -16,22 +17,19 @@ use crate::{
 
 // ── Error helper ─────────────────────────────────────────────────────────────
 
-pub(crate) struct AppError(anyhow::Error);
+pub(crate) struct AppError(pub StatusCode, pub String);
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        error!("handler error: {:?}", self.0);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": self.0.to_string()})),
-        )
-            .into_response()
+        error!("handler error: {} — {}", self.0, self.1);
+        (self.0, Json(serde_json::json!({"error": self.1}))).into_response()
     }
 }
 
 impl<E: Into<anyhow::Error>> From<E> for AppError {
     fn from(e: E) -> Self {
-        AppError(e.into())
+        let err = e.into();
+        AppError(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
     }
 }
 
@@ -79,7 +77,12 @@ pub async fn register_project(
     let plugin = state
         .plugins
         .get(&channel_name)
-        .ok_or_else(|| AppError(anyhow::anyhow!("unknown channel plugin: '{channel_name}'")))?
+        .ok_or_else(|| {
+            AppError(
+                StatusCode::BAD_REQUEST,
+                format!("unknown channel plugin: '{channel_name}'"),
+            )
+        })?
         .clone();
 
     // Plugin creates/finds the room.
@@ -131,14 +134,24 @@ pub async fn send_message(
         let conn = state.db.lock().unwrap();
         match db::get_project(&conn, &ident)? {
             Some(p) => (p.channel_name, p.room_id),
-            None => return Err(AppError(anyhow::anyhow!("project '{}' not found", ident))),
+            None => {
+                return Err(AppError(
+                    StatusCode::NOT_FOUND,
+                    format!("project '{}' not found", ident),
+                ))
+            }
         }
     };
 
     let plugin = state
         .plugins
         .get(&channel_name)
-        .ok_or_else(|| AppError(anyhow::anyhow!("plugin '{channel_name}' not loaded")))?
+        .ok_or_else(|| {
+            AppError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("plugin '{channel_name}' not loaded"),
+            )
+        })?
         .clone();
 
     let formatted = format!("[AGENT] {}", body.content);
@@ -164,6 +177,107 @@ pub async fn send_message(
         message_id: row_id,
         external_message_id: external_id,
     }))
+}
+
+// ── Skills API ────────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct SkillUploadResponse {
+    pub name: String,
+    pub size: i64,
+    pub checksum: String,
+}
+
+pub async fn upload_skill(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> Result<Json<SkillUploadResponse>> {
+    use sha2::{Digest, Sha256};
+    let zip = body.to_vec();
+    let size = zip.len() as i64;
+    let mut hasher = Sha256::new();
+    hasher.update(&zip);
+    let checksum = hex::encode(hasher.finalize());
+
+    let record = db::SkillRecord {
+        name: name.clone(),
+        zip_data: zip,
+        size,
+        checksum: checksum.clone(),
+        uploaded_at: db::now_ms(),
+    };
+    let db = state.db.clone();
+    spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::upsert_skill(&conn, &record)
+    })
+    .await??;
+
+    Ok(Json(SkillUploadResponse {
+        name,
+        size,
+        checksum,
+    }))
+}
+
+pub async fn list_skills_handler(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<db::SkillMeta>>> {
+    let db = state.db.clone();
+    let skills = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::list_skills(&conn)
+    })
+    .await??;
+    Ok(Json(skills))
+}
+
+pub async fn download_skill(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse> {
+    let db = state.db.clone();
+    let record = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::get_skill(&conn, &name)
+    })
+    .await??;
+
+    match record {
+        None => Err(AppError(StatusCode::NOT_FOUND, "skill not found".into())),
+        Some(r) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/zip"),
+            );
+            let cd = format!("attachment; filename=\"{}.zip\"", r.name);
+            headers.insert(
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_str(&cd).unwrap_or(HeaderValue::from_static("attachment")),
+            );
+            Ok((headers, r.zip_data))
+        }
+    }
+}
+
+pub async fn delete_skill_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode> {
+    let db = state.db.clone();
+    let existed = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::delete_skill(&conn, &name)
+    })
+    .await??;
+
+    if existed {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError(StatusCode::NOT_FOUND, "skill not found".into()))
+    }
 }
 
 // ── GET / (dashboard) ─────────────────────────────────────────────────────────
@@ -247,6 +361,7 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
   <div class="card"><div class="card-n">{}</div><div class="card-l">Total messages</div></div>
   <div class="card"><div class="card-n">{}</div><div class="card-l">Agent</div></div>
   <div class="card"><div class="card-n">{}</div><div class="card-l">User</div></div>
+  <div class="card"><div class="card-n">{}</div><div class="card-l">Skills</div></div>
 </div>
 <div class="section">
   <div class="section-head">Projects</div>
@@ -262,6 +377,7 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
         data.total_messages,
         data.agent_messages,
         data.user_messages,
+        data.skill_count,
         rows,
         empty_row,
     );
@@ -284,7 +400,10 @@ pub async fn get_unread_messages(
     {
         let conn = state.db.lock().unwrap();
         if db::get_project(&conn, &ident)?.is_none() {
-            return Err(AppError(anyhow::anyhow!("project '{}' not found", ident)));
+            return Err(AppError(
+                StatusCode::NOT_FOUND,
+                format!("project '{}' not found", ident),
+            ));
         }
     }
 

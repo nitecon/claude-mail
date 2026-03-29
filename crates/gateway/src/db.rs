@@ -64,6 +64,14 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             project_ident  TEXT PRIMARY KEY REFERENCES projects(ident),
             last_read_id   INTEGER NOT NULL DEFAULT 0,
             updated_at     INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS skills (
+            name        TEXT PRIMARY KEY,
+            zip_data    BLOB NOT NULL,
+            size        INTEGER NOT NULL,
+            checksum    TEXT NOT NULL,
+            uploaded_at INTEGER NOT NULL
         );",
     )
     .context("apply schema")
@@ -246,6 +254,7 @@ pub struct DashboardData {
     pub total_messages: i64,
     pub agent_messages: i64,
     pub user_messages: i64,
+    pub skill_count: i64,
     pub projects: Vec<ProjectStats>,
 }
 
@@ -262,6 +271,7 @@ pub fn get_dashboard_data(conn: &Connection) -> Result<DashboardData> {
         [],
         |r| r.get(0),
     )?;
+    let skill_count: i64 = conn.query_row("SELECT COUNT(*) FROM skills", [], |r| r.get(0))?;
 
     let mut stmt = conn.prepare_cached(
         "SELECT p.ident, p.channel_name, p.room_id,
@@ -293,6 +303,76 @@ pub fn get_dashboard_data(conn: &Connection) -> Result<DashboardData> {
         total_messages,
         agent_messages,
         user_messages,
+        skill_count,
         projects,
     })
+}
+
+// ── Skills ────────────────────────────────────────────────────────────────────
+
+pub struct SkillRecord {
+    pub name: String,
+    pub zip_data: Vec<u8>,
+    pub size: i64,
+    pub checksum: String,
+    pub uploaded_at: i64,
+}
+
+#[derive(serde::Serialize)]
+pub struct SkillMeta {
+    pub name: String,
+    pub size: i64,
+    pub checksum: String,
+    pub uploaded_at: i64,
+}
+
+pub fn upsert_skill(conn: &Connection, r: &SkillRecord) -> Result<()> {
+    conn.execute(
+        "INSERT INTO skills (name, zip_data, size, checksum, uploaded_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(name) DO UPDATE SET
+             zip_data = excluded.zip_data,
+             size = excluded.size,
+             checksum = excluded.checksum,
+             uploaded_at = excluded.uploaded_at",
+        params![r.name, r.zip_data, r.size, r.checksum, r.uploaded_at],
+    )?;
+    Ok(())
+}
+
+pub fn get_skill(conn: &Connection, name: &str) -> Result<Option<SkillRecord>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT name, zip_data, size, checksum, uploaded_at FROM skills WHERE name = ?1",
+    )?;
+    let mut rows = stmt.query_map(params![name], |r| {
+        Ok(SkillRecord {
+            name: r.get(0)?,
+            zip_data: r.get(1)?,
+            size: r.get(2)?,
+            checksum: r.get(3)?,
+            uploaded_at: r.get(4)?,
+        })
+    })?;
+    Ok(rows.next().transpose()?)
+}
+
+pub fn list_skills(conn: &Connection) -> Result<Vec<SkillMeta>> {
+    let mut stmt = conn
+        .prepare_cached("SELECT name, size, checksum, uploaded_at FROM skills ORDER BY name ASC")?;
+    let collected = stmt
+        .query_map([], |r| {
+            Ok(SkillMeta {
+                name: r.get(0)?,
+                size: r.get(1)?,
+                checksum: r.get(2)?,
+                uploaded_at: r.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(collected)
+}
+
+pub fn delete_skill(conn: &Connection, name: &str) -> Result<bool> {
+    let n = conn.execute("DELETE FROM skills WHERE name = ?1", params![name])?;
+    Ok(n > 0)
 }

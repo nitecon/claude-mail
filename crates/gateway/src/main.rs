@@ -10,7 +10,7 @@ use axum::{
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
@@ -230,6 +230,13 @@ async fn main() -> Result<()> {
         .route(
             "/v1/projects/{ident}/messages/unread",
             get(routes::get_unread_messages),
+        )
+        .route("/v1/skills", get(routes::list_skills_handler))
+        .route(
+            "/v1/skills/{name}",
+            put(routes::upload_skill)
+                .get(routes::download_skill)
+                .delete(routes::delete_skill_handler),
         )
         .layer(middleware::from_fn_with_state(state.clone(), bearer_auth));
 
