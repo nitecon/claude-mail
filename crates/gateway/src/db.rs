@@ -7,8 +7,12 @@ pub type Db = Arc<Mutex<Connection>>;
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Project {
     pub ident: String,
-    pub discord_channel_id: String,
-    pub last_discord_msg_id: Option<String>,
+    /// Name of the channel plugin handling this project ("discord", "slack", …).
+    pub channel_name: String,
+    /// Opaque, plugin-specific room identifier.
+    pub room_id: String,
+    /// Opaque ID of the last inbound message seen (backfill cursor).
+    pub last_msg_id: Option<String>,
     pub created_at: i64,
 }
 
@@ -16,8 +20,10 @@ pub struct Project {
 pub struct Message {
     pub id: i64,
     pub project_ident: String,
+    /// "agent" | "user"
     pub source: String,
-    pub discord_message_id: Option<String>,
+    /// Opaque, plugin-specific message identifier.
+    pub external_message_id: Option<String>,
     pub content: String,
     pub sent_at: i64,
 }
@@ -35,17 +41,18 @@ pub fn open(path: &str) -> Result<Db> {
 fn apply_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS projects (
-            ident                TEXT PRIMARY KEY,
-            discord_channel_id   TEXT NOT NULL,
-            last_discord_msg_id  TEXT,
-            created_at           INTEGER NOT NULL
+            ident         TEXT PRIMARY KEY,
+            channel_name  TEXT NOT NULL,
+            room_id       TEXT NOT NULL,
+            last_msg_id   TEXT,
+            created_at    INTEGER NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS messages (
             id                   INTEGER PRIMARY KEY AUTOINCREMENT,
             project_ident        TEXT NOT NULL REFERENCES projects(ident),
             source               TEXT NOT NULL CHECK(source IN ('agent','user')),
-            discord_message_id   TEXT,
+            external_message_id  TEXT,
             content              TEXT NOT NULL,
             sent_at              INTEGER NOT NULL
         );
@@ -66,21 +73,34 @@ fn apply_schema(conn: &Connection) -> Result<()> {
 
 pub fn get_project(conn: &Connection, ident: &str) -> Result<Option<Project>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT ident, discord_channel_id, last_discord_msg_id, created_at
+        "SELECT ident, channel_name, room_id, last_msg_id, created_at
          FROM projects WHERE ident = ?1",
     )?;
     let mut rows = stmt.query_map(params![ident], row_to_project)?;
     Ok(rows.next().transpose()?)
 }
 
+/// Find a project by its plugin-specific room_id and channel_name.
+pub fn get_project_by_room(
+    conn: &Connection,
+    channel_name: &str,
+    room_id: &str,
+) -> Result<Option<Project>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT ident, channel_name, room_id, last_msg_id, created_at
+         FROM projects WHERE channel_name = ?1 AND room_id = ?2",
+    )?;
+    let mut rows = stmt.query_map(params![channel_name, room_id], row_to_project)?;
+    Ok(rows.next().transpose()?)
+}
+
 pub fn insert_project(conn: &Connection, p: &Project) -> Result<()> {
     conn.execute(
-        "INSERT INTO projects (ident, discord_channel_id, last_discord_msg_id, created_at)
-         VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO projects (ident, channel_name, room_id, last_msg_id, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(ident) DO NOTHING",
-        params![p.ident, p.discord_channel_id, p.last_discord_msg_id, p.created_at],
+        params![p.ident, p.channel_name, p.room_id, p.last_msg_id, p.created_at],
     )?;
-    // Ensure cursor row exists
     conn.execute(
         "INSERT INTO cursors (project_ident, last_read_id, updated_at)
          VALUES (?1, 0, ?2)
@@ -92,19 +112,17 @@ pub fn insert_project(conn: &Connection, p: &Project) -> Result<()> {
 
 pub fn all_projects(conn: &Connection) -> Result<Vec<Project>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT ident, discord_channel_id, last_discord_msg_id, created_at FROM projects",
+        "SELECT ident, channel_name, room_id, last_msg_id, created_at FROM projects",
     )?;
-    let rows = stmt.query_map([], row_to_project)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    let collected = stmt
+        .query_map([], row_to_project)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(collected)
 }
 
-pub fn update_last_discord_msg_id(
-    conn: &Connection,
-    ident: &str,
-    msg_id: &str,
-) -> Result<()> {
+pub fn update_last_msg_id(conn: &Connection, ident: &str, msg_id: &str) -> Result<()> {
     conn.execute(
-        "UPDATE projects SET last_discord_msg_id = ?1 WHERE ident = ?2",
+        "UPDATE projects SET last_msg_id = ?1 WHERE ident = ?2",
         params![msg_id, ident],
     )?;
     Ok(())
@@ -113,9 +131,10 @@ pub fn update_last_discord_msg_id(
 fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
         ident: row.get(0)?,
-        discord_channel_id: row.get(1)?,
-        last_discord_msg_id: row.get(2)?,
-        created_at: row.get(3)?,
+        channel_name: row.get(1)?,
+        room_id: row.get(2)?,
+        last_msg_id: row.get(3)?,
+        created_at: row.get(4)?,
     })
 }
 
@@ -123,25 +142,17 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
 
 pub fn insert_message(conn: &Connection, m: &Message) -> Result<i64> {
     conn.execute(
-        "INSERT INTO messages (project_ident, source, discord_message_id, content, sent_at)
+        "INSERT INTO messages (project_ident, source, external_message_id, content, sent_at)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             m.project_ident,
             m.source,
-            m.discord_message_id,
+            m.external_message_id,
             m.content,
             m.sent_at
         ],
     )?;
     Ok(conn.last_insert_rowid())
-}
-
-pub fn update_discord_message_id(conn: &Connection, id: i64, discord_id: &str) -> Result<()> {
-    conn.execute(
-        "UPDATE messages SET discord_message_id = ?1 WHERE id = ?2",
-        params![discord_id, id],
-    )?;
-    Ok(())
 }
 
 /// Returns unread messages and advances the cursor atomically (BEGIN IMMEDIATE).
@@ -158,7 +169,7 @@ pub fn get_and_advance_cursor(conn: &Connection, ident: &str) -> Result<Vec<Mess
 
     let msgs: Vec<Message> = {
         let mut stmt = conn.prepare_cached(
-            "SELECT id, project_ident, source, discord_message_id, content, sent_at
+            "SELECT id, project_ident, source, external_message_id, content, sent_at
              FROM messages
              WHERE project_ident = ?1 AND id > ?2
              ORDER BY id ASC",
@@ -181,40 +192,18 @@ pub fn get_and_advance_cursor(conn: &Connection, ident: &str) -> Result<Vec<Mess
     Ok(msgs)
 }
 
-pub fn messages_after(
-    conn: &Connection,
-    ident: &str,
-    after_discord_id: &str,
-) -> Result<Vec<Message>> {
-    // Fetch by discord_message_id ordering (snowflakes are ordered by time).
-    // We insert messages where discord_message_id > after_discord_id lexicographically,
-    // which works for Discord snowflakes (they are monotonically increasing).
-    let mut stmt = conn.prepare_cached(
-        "SELECT id, project_ident, source, discord_message_id, content, sent_at
-         FROM messages
-         WHERE project_ident = ?1
-           AND source = 'user'
-           AND discord_message_id > ?2
-         ORDER BY id ASC",
-    )?;
-    let collected = stmt
-        .query_map(params![ident, after_discord_id], row_to_message)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(collected)
-}
-
 fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     Ok(Message {
         id: row.get(0)?,
         project_ident: row.get(1)?,
         source: row.get(2)?,
-        discord_message_id: row.get(3)?,
+        external_message_id: row.get(3)?,
         content: row.get(4)?,
         sent_at: row.get(5)?,
     })
 }
 
-// ── Retention ────────────────────────────────────────────────────────────────
+// ── Retention ─────────────────────────────────────────────────────────────────
 
 pub fn purge_old_messages(conn: &Connection, cutoff_ms: i64) -> Result<usize> {
     let n = conn.execute(

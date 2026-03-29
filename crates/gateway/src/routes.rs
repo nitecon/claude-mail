@@ -11,7 +11,6 @@ use tracing::error;
 use crate::{
     AppState,
     db::{self, Message, Project, now_ms},
-    discord,
     projects::sanitize_ident,
 };
 
@@ -44,48 +43,53 @@ type Result<T> = std::result::Result<T, AppError>;
 pub struct RegisterProjectRequest {
     /// Raw project identity (git remote URL or directory name).
     pub ident: String,
+    /// Which channel plugin to use. Defaults to gateway's DEFAULT_CHANNEL.
+    pub channel: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct RegisterProjectResponse {
     pub ident: String,
     pub channel_name: String,
-    pub discord_channel_id: String,
+    pub room_id: String,
 }
 
 pub async fn register_project(
     State(state): State<AppState>,
     Json(body): Json<RegisterProjectRequest>,
 ) -> Result<Json<RegisterProjectResponse>> {
-    let channel_name = sanitize_ident(&body.ident);
+    let project_ident = sanitize_ident(&body.ident);
+    let channel_name = body.channel.unwrap_or_else(|| state.default_channel.clone());
 
-    // Check if already registered.
+    // Return existing project immediately (idempotent).
     {
         let conn = state.db.lock().unwrap();
-        if let Some(existing) = db::get_project(&conn, &channel_name)? {
+        if let Some(existing) = db::get_project(&conn, &project_ident)? {
             return Ok(Json(RegisterProjectResponse {
-                ident: channel_name.clone(),
-                channel_name: channel_name.clone(),
-                discord_channel_id: existing.discord_channel_id,
+                ident: existing.ident,
+                channel_name: existing.channel_name,
+                room_id: existing.room_id,
             }));
         }
     }
 
-    // Ensure Discord channel exists.
-    let discord_channel_id = discord::ensure_channel(
-        &state.discord,
-        &channel_name,
-        &state.project_channel_ids,
-    )
-    .await?;
+    // Look up the requested plugin.
+    let plugin = state
+        .plugins
+        .get(&channel_name)
+        .ok_or_else(|| AppError(anyhow::anyhow!("unknown channel plugin: '{channel_name}'")))?
+        .clone();
+
+    // Plugin creates/finds the room.
+    let room_id = plugin.ensure_room(&project_ident).await?;
 
     // Persist.
-    let now = now_ms();
     let project = Project {
-        ident: channel_name.clone(),
-        discord_channel_id: discord_channel_id.clone(),
-        last_discord_msg_id: None,
-        created_at: now,
+        ident: project_ident.clone(),
+        channel_name: channel_name.clone(),
+        room_id: room_id.clone(),
+        last_msg_id: None,
+        created_at: now_ms(),
     };
 
     let db = state.db.clone();
@@ -97,9 +101,9 @@ pub async fn register_project(
     .await??;
 
     Ok(Json(RegisterProjectResponse {
-        ident: channel_name.clone(),
+        ident: project_ident,
         channel_name,
-        discord_channel_id,
+        room_id,
     }))
 }
 
@@ -113,7 +117,7 @@ pub struct SendMessageRequest {
 #[derive(Serialize)]
 pub struct SendMessageResponse {
     pub message_id: i64,
-    pub discord_message_id: String,
+    pub external_message_id: String,
 }
 
 pub async fn send_message(
@@ -121,28 +125,30 @@ pub async fn send_message(
     Path(ident): Path<String>,
     Json(body): Json<SendMessageRequest>,
 ) -> Result<Json<SendMessageResponse>> {
-    // Verify project exists and get channel ID in one lock.
-    let channel_id = {
+    let (channel_name, room_id) = {
         let conn = state.db.lock().unwrap();
         match db::get_project(&conn, &ident)? {
-            Some(p) => p.discord_channel_id,
+            Some(p) => (p.channel_name, p.room_id),
             None => return Err(AppError(anyhow::anyhow!("project '{}' not found", ident))),
         }
     };
 
-    // Format and send to Discord.
-    let formatted = format!("[AGENT] {}", body.content);
-    let discord_id = discord::post_message(&state.discord, &channel_id, &formatted).await?;
+    let plugin = state
+        .plugins
+        .get(&channel_name)
+        .ok_or_else(|| AppError(anyhow::anyhow!("plugin '{channel_name}' not loaded")))?
+        .clone();
 
-    // Persist in local DB.
-    let now = now_ms();
+    let formatted = format!("[AGENT] {}", body.content);
+    let external_id = plugin.send(&room_id, &formatted).await?;
+
     let msg = Message {
         id: 0,
         project_ident: ident.clone(),
         source: "agent".into(),
-        discord_message_id: Some(discord_id.clone()),
+        external_message_id: Some(external_id.clone()),
         content: body.content,
-        sent_at: now,
+        sent_at: now_ms(),
     };
 
     let db = state.db.clone();
@@ -154,7 +160,7 @@ pub async fn send_message(
 
     Ok(Json(SendMessageResponse {
         message_id: row_id,
-        discord_message_id: discord_id,
+        external_message_id: external_id,
     }))
 }
 
@@ -170,7 +176,6 @@ pub async fn get_unread_messages(
     State(state): State<AppState>,
     Path(ident): Path<String>,
 ) -> Result<Json<GetUnreadResponse>> {
-    // Verify project exists.
     {
         let conn = state.db.lock().unwrap();
         if db::get_project(&conn, &ident)?.is_none() {

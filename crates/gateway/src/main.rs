@@ -1,5 +1,6 @@
+mod channel;
+mod channels;
 mod db;
-mod discord;
 mod projects;
 mod routes;
 
@@ -13,23 +14,24 @@ use axum::{
     routing::{get, post},
 };
 use std::{
+    collections::HashMap,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
-use tokio::task::spawn_blocking;
+use tokio::{sync::mpsc, task::spawn_blocking};
 use tracing::info;
 
+use channel::{ChannelPlugin, PluginEvent};
 use db::Db;
-use discord::DiscordHttp;
 
-// ── App state shared across all handlers ─────────────────────────────────────
+// ── App state ─────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Db,
-    pub discord: Arc<DiscordHttp>,
-    pub project_channel_ids: Arc<Mutex<std::collections::HashSet<u64>>>,
+    pub plugins: Arc<HashMap<String, Arc<dyn ChannelPlugin>>>,
+    pub default_channel: String,
     pub api_key: String,
 }
 
@@ -53,11 +55,60 @@ async fn bearer_auth(
     }
 }
 
+// ── Inbound message processor ─────────────────────────────────────────────────
+
+fn spawn_inbound_processor(db: Db, mut rx: mpsc::Receiver<PluginEvent>) {
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            let PluginEvent::Message {
+                channel_name,
+                room_id,
+                message,
+            } = event;
+
+            let db = db.clone();
+            let result = spawn_blocking(move || {
+                let conn = db.lock().unwrap();
+
+                // Resolve room_id → project_ident.
+                let project =
+                    match db::get_project_by_room(&conn, &channel_name, &room_id)? {
+                        Some(p) => p,
+                        None => {
+                            tracing::warn!(
+                                "Received message for unknown room {room_id} on {channel_name}"
+                            );
+                            return Ok::<_, anyhow::Error>(());
+                        }
+                    };
+
+                let m = db::Message {
+                    id: 0,
+                    project_ident: project.ident.clone(),
+                    source: "user".into(),
+                    external_message_id: Some(message.id.clone()),
+                    content: message.content,
+                    sent_at: db::now_ms(),
+                };
+                db::insert_message(&conn, &m)?;
+                db::update_last_msg_id(&conn, &project.ident, &message.id)?;
+                Ok(())
+            })
+            .await;
+
+            if let Err(e) = result {
+                tracing::error!("Inbound processor task error: {e}");
+            } else if let Ok(Err(e)) = result {
+                tracing::error!("Inbound processor db error: {e}");
+            }
+        }
+    });
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load .env (best-effort)
     let _ = dotenvy::dotenv();
 
     tracing_subscriber::fmt()
@@ -67,18 +118,10 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // ── Config ───────────────────────────────────────────────────────────────
-    let discord_token =
-        require_env("DISCORD_BOT_TOKEN");
-    let guild_id: u64 = require_env("DISCORD_GUILD_ID")
-        .parse()
-        .context("DISCORD_GUILD_ID must be a u64")?;
-    let category_id: Option<u64> = std::env::var("DISCORD_CATEGORY_ID")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.parse().context("DISCORD_CATEGORY_ID must be a u64"))
-        .transpose()?;
+    // ── Config ────────────────────────────────────────────────────────────────
     let api_key = require_env("GATEWAY_API_KEY");
+    let default_channel =
+        std::env::var("DEFAULT_CHANNEL").unwrap_or_else(|_| "discord".into());
     let host = std::env::var("GATEWAY_HOST").unwrap_or_else(|_| "0.0.0.0".into());
     let port: u16 = std::env::var("GATEWAY_PORT")
         .unwrap_or_else(|_| "3000".into())
@@ -91,35 +134,67 @@ async fn main() -> Result<()> {
         .parse()
         .context("MESSAGE_RETENTION_DAYS must be a u64")?;
 
-    // ── Database ─────────────────────────────────────────────────────────────
-    // Ensure parent directory exists.
+    // ── Database ──────────────────────────────────────────────────────────────
     if let Some(parent) = std::path::Path::new(&db_path).parent() {
         std::fs::create_dir_all(parent).context("create db directory")?;
     }
     let db = db::open(&db_path)?;
     info!("SQLite database opened at {db_path}");
 
-    // ── Discord ───────────────────────────────────────────────────────────────
-    let project_channel_ids: Arc<Mutex<std::collections::HashSet<u64>>> =
-        Arc::new(Mutex::new(std::collections::HashSet::new()));
+    // ── Plugin registry ───────────────────────────────────────────────────────
+    let mut plugins: HashMap<String, Arc<dyn ChannelPlugin>> = HashMap::new();
 
-    let discord = discord::start(
-        &discord_token,
-        guild_id,
-        category_id,
-        db.clone(),
-        project_channel_ids.clone(),
-    )
-    .await?;
-    info!("Discord bot started (guild={guild_id})");
+    #[cfg(feature = "discord")]
+    {
+        let token = require_env("DISCORD_BOT_TOKEN");
+        let guild_id: u64 = require_env("DISCORD_GUILD_ID")
+            .parse()
+            .context("DISCORD_GUILD_ID must be a u64")?;
+        let category_id: Option<u64> = std::env::var("DISCORD_CATEGORY_ID")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse().context("DISCORD_CATEGORY_ID must be a u64"))
+            .transpose()?;
 
-    // ── App state ─────────────────────────────────────────────────────────────
-    let state = AppState {
-        db: db.clone(),
-        discord,
-        project_channel_ids,
-        api_key,
+        let discord = Arc::new(channels::discord::DiscordPlugin::new(
+            channels::discord::DiscordConfig { token, guild_id, category_id },
+        ));
+        plugins.insert("discord".into(), discord);
+        info!("Registered channel plugin: discord");
+    }
+
+    if plugins.is_empty() {
+        anyhow::bail!("No channel plugins enabled. Build with --features discord (or others).");
+    }
+    if !plugins.contains_key(&default_channel) {
+        anyhow::bail!(
+            "DEFAULT_CHANNEL='{default_channel}' is not among the enabled plugins: {:?}",
+            plugins.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ── Load existing projects and register rooms with their plugins ──────────
+    let existing_projects = {
+        let conn = db.lock().unwrap();
+        db::all_projects(&conn)?
     };
+    for project in &existing_projects {
+        if let Some(plugin) = plugins.get(&project.channel_name) {
+            plugin.register_room(&project.room_id, project.last_msg_id.as_deref());
+        }
+    }
+    info!("Registered {} existing project room(s)", existing_projects.len());
+
+    // ── Start plugins (connects gateways, spawns background tasks) ────────────
+    let (tx, rx) = mpsc::channel::<PluginEvent>(256);
+    for plugin in plugins.values() {
+        plugin.start(tx.clone()).await?;
+        info!("Started channel plugin: {}", plugin.name());
+    }
+    drop(tx); // rx closes when all plugin senders drop
+
+    // ── Inbound message processor ─────────────────────────────────────────────
+    spawn_inbound_processor(db.clone(), rx);
 
     // ── Retention task ────────────────────────────────────────────────────────
     {
@@ -145,7 +220,14 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ── Router ────────────────────────────────────────────────────────────────
+    // ── HTTP router ───────────────────────────────────────────────────────────
+    let state = AppState {
+        db,
+        plugins: Arc::new(plugins),
+        default_channel,
+        api_key,
+    };
+
     let app = Router::new()
         .route("/v1/projects", post(routes::register_project))
         .route("/v1/projects/{ident}/messages", post(routes::send_message))
@@ -159,8 +241,8 @@ async fn main() -> Result<()> {
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
         .context("parse listen address")?;
-
     info!("Gateway listening on http://{addr}");
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
 

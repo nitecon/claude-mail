@@ -37,9 +37,9 @@ async fn main() -> Result<()> {
 
     // Auto-register default identity if configured.
     if let Some(ident) = default_ident {
-        match gw.register_project(&ident).await {
+        match gw.register_project(&ident, None).await {
             Ok(resp) => {
-                server.set_default_ident(resp.ident);
+                server.set_default_ident(resp.ident, resp.channel_name);
             }
             Err(e) => {
                 tracing::warn!("Failed to auto-register default identity '{ident}': {e}");

@@ -7,10 +7,16 @@ edition = "2021"
 name = "gateway"
 path = "src/main.rs"
 
+[features]
+default = ["discord"]
+discord = ["dep:serenity"]
+# future: slack = ["dep:slack-morphism"]
+# future: email = ["dep:lettre", "dep:async-imap"]
+
 [dependencies]
 axum = { version = "0.8", features = ["json", "http1"] }
 tokio = { version = "1", features = ["full"] }
-serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "rustls_backend"] }
+serenity = { version = "0.12", optional = true, default-features = false, features = ["client", "gateway", "model", "rustls_backend"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -20,6 +26,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.10"
 hex = "0.4"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors"] }
 async-trait = "0.1"
 anyhow = "1"

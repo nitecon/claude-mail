@@ -15,13 +15,15 @@ pub struct GatewayClient {
 #[derive(Serialize)]
 struct RegisterProjectRequest<'a> {
     ident: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
 pub struct RegisterProjectResponse {
     pub ident: String,
     pub channel_name: String,
-    pub discord_channel_id: String,
+    pub room_id: String,
 }
 
 #[derive(Serialize)]
@@ -32,7 +34,7 @@ struct SendMessageRequest<'a> {
 #[derive(Deserialize)]
 pub struct SendMessageResponse {
     pub message_id: i64,
-    pub discord_message_id: String,
+    pub external_message_id: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -66,14 +68,18 @@ impl GatewayClient {
     }
 
     /// Register (or re-register) a project with the gateway.
-    /// Returns the sanitized channel name.
-    pub async fn register_project(&self, ident: &str) -> Result<RegisterProjectResponse> {
+    /// `channel` selects the plugin; pass `None` to use the gateway's default.
+    pub async fn register_project(
+        &self,
+        ident: &str,
+        channel: Option<&str>,
+    ) -> Result<RegisterProjectResponse> {
         let url = format!("{}/v1/projects", self.base_url);
         let resp = self
             .client
             .post(&url)
             .header("Authorization", self.auth())
-            .json(&RegisterProjectRequest { ident })
+            .json(&RegisterProjectRequest { ident, channel })
             .send()
             .await
             .context("POST /v1/projects")?;
@@ -89,7 +95,7 @@ impl GatewayClient {
             .context("decode register response")
     }
 
-    /// Post an agent message to the project's Discord channel.
+    /// Post an agent message to the project's channel.
     pub async fn send_message(&self, ident: &str, content: &str) -> Result<SendMessageResponse> {
         let url = format!("{}/v1/projects/{}/messages", self.base_url, ident);
         let resp = self
