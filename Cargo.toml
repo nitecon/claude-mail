@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/gateway", "crates/mcp-server"]
+resolver = "2"
