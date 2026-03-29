@@ -28,3 +28,5 @@ hex = "0.4"
 tower = "0.5"
 async-trait = "0.1"
 anyhow = "1"
+reqwest = { version = "0.13", features = ["json"] }
+updater = { path = "../updater" }

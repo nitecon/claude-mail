@@ -57,6 +57,8 @@ enum Command {
         /// Skill name
         name: String,
     },
+    /// Check for a newer version and update the binary in place
+    Update,
     /// Bidirectional sync: push new/changed local skills, pull new remote skills
     Sync {
         /// Root directory containing skill subdirectories (default: current directory)
@@ -300,6 +302,26 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
 
     let cli = Cli::parse();
+
+    // Handle update before building the gateway client (it doesn't need one).
+    if let Command::Update = &cli.command {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .context("build http client")?;
+        let current = env!("CARGO_PKG_VERSION");
+        match updater::check_update(&http, current).await? {
+            None => {
+                println!("Already up to date (v{}).", current);
+            }
+            Some(version) => {
+                println!("Updating claude-mail-skills {} -> {}...", current, version);
+                updater::perform_update(&http, &version, "claude-mail-skills").await?;
+            }
+        }
+        return Ok(());
+    }
+
     let client = require_client(cli.url, cli.api_key, cli.timeout_ms)?;
 
     match cli.command {
@@ -308,5 +330,6 @@ async fn main() -> Result<()> {
         Command::List => cmd_list(&client).await,
         Command::Delete { name } => cmd_delete(&client, name).await,
         Command::Sync { dir } => cmd_sync(&client, dir).await,
+        Command::Update => unreachable!(),
     }
 }

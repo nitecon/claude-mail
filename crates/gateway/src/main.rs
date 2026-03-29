@@ -108,6 +108,26 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // ── Background update check (non-blocking) ────────────────────────────────
+    {
+        let check_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
+        tokio::spawn(async move {
+            match updater::check_update(&check_client, env!("CARGO_PKG_VERSION")).await {
+                Ok(Some(v)) => tracing::warn!(
+                    "A new version of claude-mail is available: {} (current: {}). \
+                     Visit https://github.com/nitecon/claude-mail/releases",
+                    v,
+                    env!("CARGO_PKG_VERSION")
+                ),
+                Ok(None) => {}
+                Err(e) => tracing::debug!("Update check failed: {e}"),
+            }
+        });
+    }
+
     // ── Config ────────────────────────────────────────────────────────────────
     let api_key = require_env("GATEWAY_API_KEY");
     let default_channel = std::env::var("DEFAULT_CHANNEL").unwrap_or_else(|_| "discord".into());

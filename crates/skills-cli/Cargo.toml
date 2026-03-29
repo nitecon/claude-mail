@@ -19,3 +19,4 @@ sha2 = "0.10"
 walkdir = "2"
 zip = { version = "2", features = ["deflate"] }
 tokio = { version = "1", features = ["full"] }
+updater = { path = "../updater" }

@@ -1,6 +1,6 @@
 # claude-mail
 
-Async communication between AI agents and humans via Discord.
+Async communication between AI agents and humans via Discord, with cross-machine skill sharing.
 
 AI agents (Claude, Gemini, Codex, etc.) often run unattended for extended periods. claude-mail gives them a way to send you messages and check for your replies — without you needing to watch a terminal. Each project gets its own Discord channel, messages are persisted locally, and multiple agent sessions across different machines share the same channel.
 
@@ -36,12 +36,67 @@ Multiple machines running agents on the same project share the same channel and 
 claude-mail/
 ├── crates/
 │   ├── gateway/        # Persistent HTTP service + Discord bot
-│   └── mcp-server/     # stdio MCP server (installed per machine)
+│   ├── mcp-server/     # stdio MCP server (installed per machine)
+│   └── skills-cli/     # CLI for pushing/pulling shared skills
 ```
+
+---
+
+## Installation
+
+### Pre-built binaries
+
+Each release ships archives for all major platforms. Each archive contains three binaries:
+- `claude-mail` — MCP server (per-machine)
+- `claude-mail-gateway` — Gateway service
+- `claude-mail-skills` — Skills management CLI
+
+**Linux / macOS**
+
+```bash
+# Get the latest release tag
+VERSION=$(curl -fsSL https://api.github.com/repos/nitecon/claude-mail/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
+
+# Linux x86_64
+curl -fsSL "https://github.com/nitecon/claude-mail/releases/download/${VERSION}/claude-mail-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" | tar xz --strip-components=1
+
+# Linux ARM64
+curl -fsSL "https://github.com/nitecon/claude-mail/releases/download/${VERSION}/claude-mail-${VERSION}-aarch64-unknown-linux-gnu.tar.gz" | tar xz --strip-components=1
+
+# macOS Apple Silicon
+curl -fsSL "https://github.com/nitecon/claude-mail/releases/download/${VERSION}/claude-mail-${VERSION}-aarch64-apple-darwin.tar.gz" | tar xz --strip-components=1
+
+# macOS Intel
+curl -fsSL "https://github.com/nitecon/claude-mail/releases/download/${VERSION}/claude-mail-${VERSION}-x86_64-apple-darwin.tar.gz" | tar xz --strip-components=1
+```
+
+**Windows (PowerShell)**
+
+```powershell
+$version = (Invoke-RestMethod https://api.github.com/repos/nitecon/claude-mail/releases/latest).tag_name
+Invoke-WebRequest -Uri "https://github.com/nitecon/claude-mail/releases/download/$version/claude-mail-$version-x86_64-pc-windows-msvc.zip" -OutFile "claude-mail-$version.zip"
+Expand-Archive -Path "claude-mail-$version.zip" -DestinationPath "." -Force
+```
+
+Move the extracted binaries somewhere on your `PATH` (e.g. `/usr/local/bin` on Linux/macOS, or `C:\Tools` on Windows).
+
+### Build from source
+
+```bash
+git clone https://github.com/nitecon/claude-mail
+cd claude-mail
+cargo build --release
+```
+
+Binaries:
+- `target/release/gateway`
+- `target/release/claude-mail`
+- `target/release/claude-mail-skills`
+
+---
 
 ## Prerequisites
 
-- Rust (stable, 1.75+) — [rustup.rs](https://rustup.rs)
 - A Discord account and server you control
 - The gateway reachable from all machines running the MCP server (LAN, VPN, or public host)
 
@@ -49,21 +104,7 @@ claude-mail/
 
 ## Getting started
 
-### 1. Clone and build
-
-```bash
-git clone https://github.com/yourorg/claude-mail
-cd claude-mail
-cargo build --release
-```
-
-Binaries will be at:
-- `target/release/gateway`
-- `target/release/claude-mail`
-
----
-
-### 2. Create a Discord bot
+### 1. Create a Discord bot
 
 1. Go to [discord.com/developers/applications](https://discord.com/developers/applications) and click **New Application**.
 2. Under **Bot**, click **Add Bot**.
@@ -80,7 +121,7 @@ Binaries will be at:
 
 ---
 
-### 3. Get your server and category IDs
+### 2. Get your server and category IDs
 
 Enable **Developer Mode** in Discord (Settings → Advanced → Developer Mode), then:
 
@@ -89,14 +130,13 @@ Enable **Developer Mode** in Discord (Settings → Advanced → Developer Mode),
 
 ---
 
-### 4. Configure the gateway
+### 3. Configure the gateway
+
+Copy the example env file and fill in your values:
 
 ```bash
-cd crates/gateway
-cp .env.example .env
+cp crates/gateway/.env.example crates/gateway/.env
 ```
-
-Edit `.env`:
 
 ```env
 DISCORD_BOT_TOKEN=your-bot-token-here
@@ -104,86 +144,68 @@ DISCORD_GUILD_ID=123456789012345678
 DISCORD_CATEGORY_ID=                  # optional — leave blank for top-level channels
 GATEWAY_API_KEY=choose-a-long-random-secret
 GATEWAY_HOST=0.0.0.0
-GATEWAY_PORT=3000
+GATEWAY_PORT=7913
 DATABASE_PATH=./data/claude-mail.db
 MESSAGE_RETENTION_DAYS=30
 RUST_LOG=info
 ```
 
-> `GATEWAY_API_KEY` is the shared secret between the gateway and all MCP server instances. Use a long random string (e.g. `openssl rand -hex 32`).
+> `GATEWAY_API_KEY` is the shared secret between the gateway and all clients. Use a long random string (e.g. `openssl rand -hex 32`).
 
 ---
 
-### 5. Start the gateway
+### 4. Start the gateway
 
 ```bash
-# From the repo root
-cargo run --release -p gateway
-
-# Or run the binary directly
-./target/release/gateway
+./claude-mail-gateway
+# or from source: cargo run --release -p gateway
 ```
 
 You should see:
 
 ```
 INFO gateway: SQLite database opened at ./data/claude-mail.db
-INFO gateway: Discord bot started (guild=123456789012345678)
-INFO gateway: Gateway listening on http://0.0.0.0:3000
+INFO gateway: Gateway listening on http://0.0.0.0:7913
 INFO gateway::discord: Discord bot connected as YourBotName#1234
 ```
 
-For production use, run this under a process manager (systemd, PM2, etc.) so it restarts on reboot.
+The dashboard is available at `http://localhost:7913/` — shows projects, message counts, and skills.
 
----
+#### Systemd (Linux)
 
-### 6. Configure the MCP server
-
-On each machine where you want agents to use claude-mail:
+A unit file is included in each release archive:
 
 ```bash
-cd crates/mcp-server
-cp .env.example .env
-```
-
-Edit `.env`:
-
-```env
-GATEWAY_URL=http://192.168.1.100:3000   # IP/hostname of the machine running the gateway
-GATEWAY_API_KEY=choose-a-long-random-secret   # must match the gateway's key
-DEFAULT_PROJECT_IDENT=                  # optional — auto-sets identity on startup
-GATEWAY_TIMEOUT_MS=5000
-RUST_LOG=info
+sudo cp claude-mail-gateway.service /etc/systemd/system/
+sudo mkdir -p /etc/claude-mail
+sudo cp crates/gateway/.env.example /etc/claude-mail/gateway.env
+# edit /etc/claude-mail/gateway.env with your values
+sudo systemctl enable --now claude-mail-gateway
 ```
 
 ---
 
-### 7. Add to Claude Code
+### 5. Configure the MCP server (interactive)
 
-In your project's `.claude/settings.json` (or globally in `~/.claude/settings.json`):
+On each machine where agents will run:
 
-```json
-{
-  "mcpServers": {
-    "claude-mail": {
-      "type": "stdio",
-      "command": "/absolute/path/to/claude-mail",
-      "env": {
-        "GATEWAY_URL": "http://192.168.1.100:3000",
-        "GATEWAY_API_KEY": "your-secret-here"
-      }
-    }
-  }
-}
+```bash
+claude-mail init
 ```
 
-> If you set `DEFAULT_PROJECT_IDENT` in the env block, `set_identity` is called automatically on startup.
+This prompts for your gateway URL and API key, then writes `~/.claude/claude-mail.conf`.
 
-For other MCP-compatible agents (Gemini, Codex, etc.), consult their documentation for adding a stdio MCP server — the binary and environment variables are the same.
+To add claude-mail to Claude Code:
+
+```bash
+claude mcp add claude-mail -- /path/to/claude-mail
+# or with an explicit URL override:
+claude mcp add claude-mail -- /path/to/claude-mail --url=http://your-gateway:7913
+```
 
 ---
 
-### 8. Instruct your agent
+### 6. Instruct your agent
 
 Add something like this to your project's `CLAUDE.md`:
 
@@ -206,30 +228,74 @@ Use the `claude-mail` MCP server to stay in contact with the user.
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `set_identity` | `project_ident: string` | Set the project identity for this session. Must be called first. Accepts a git remote URL or directory name — sanitized into a Discord channel name automatically. |
-| `send_message` | `content: string` | Send a message to the user via the project's Discord channel. Appears as `[AGENT] your message`. |
+| `set_identity` | `project_ident: string`, `channel?: string` | Set the project identity for this session. Must be called first. Accepts a git remote URL or directory name. Optional `channel` overrides the default plugin (e.g. `"discord"`). |
+| `send_message` | `content: string` | Send a message to the user via the project's channel. Appears as `[AGENT] your message`. |
 | `get_messages` | _(none)_ | Fetch unread messages since the last call. Returns `[AGENT]` and `[USER]` prefixed lines, or `"no messages"`. |
 
 **Identity examples:**
 
-| Input | Discord channel |
-|-------|----------------|
-| `github.com/nitecon/bruce.git` | `#bruce` |
-| `github.com/org/my-api-service` | `#my-api-service` |
-| `/home/user/projects/bruce` | `#bruce` |
-| `C:\Users\nitec\Documents\Projects\bruce` | `#bruce` |
+| Input | Channel name |
+|-------|-------------|
+| `github.com/nitecon/bruce.git` | `bruce` |
+| `github.com/org/my-api-service` | `my-api-service` |
+| `/home/user/projects/bruce` | `bruce` |
+| `C:\Users\nitec\Documents\Projects\bruce` | `bruce` |
+
+---
+
+## Skills CLI reference
+
+`claude-mail-skills` manages shared Claude Code skills on the gateway. A skill is any directory containing a `SKILL.md` file.
+
+```bash
+# Upload a skill directory to the gateway
+claude-mail-skills push ~/.claude/skills/my-skill
+
+# Download a skill from the gateway
+claude-mail-skills pull my-skill --to ~/.claude/skills
+
+# List all skills on the gateway
+claude-mail-skills list
+
+# Delete a skill from the gateway
+claude-mail-skills delete my-skill
+
+# Bidirectional sync: push new/changed local, pull new remote
+claude-mail-skills sync --dir ~/.claude/skills
+```
+
+Configuration uses the same `~/.claude/claude-mail.conf` written by `claude-mail init`, or CLI flags:
+
+```bash
+claude-mail-skills --url http://your-gateway:7913 --api-key <key> list
+```
 
 ---
 
 ## Gateway API reference
 
-The gateway exposes a simple REST API. All endpoints require `Authorization: Bearer <GATEWAY_API_KEY>`.
+All endpoints require `Authorization: Bearer <GATEWAY_API_KEY>`.
+
+### Messaging
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/v1/projects` | Register a project. Creates the Discord channel if it doesn't exist. Idempotent. |
+| `POST` | `/v1/projects` | Register a project. Creates the channel if needed. Idempotent. Body: `{"ident": "...", "channel": "discord"}` |
 | `POST` | `/v1/projects/:ident/messages` | Send an agent message. Body: `{"content": "..."}` |
 | `GET` | `/v1/projects/:ident/messages/unread` | Get unread messages and advance the read cursor. |
+
+### Skills
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `PUT` | `/v1/skills/:name` | Upload or replace a skill (raw zip bytes, `Content-Type: application/zip`). |
+| `GET` | `/v1/skills` | List all skills. Returns `[{name, size, checksum, uploaded_at}]`. |
+| `GET` | `/v1/skills/:name` | Download a skill as a zip file. |
+| `DELETE` | `/v1/skills/:name` | Delete a skill. |
+
+### Dashboard
+
+`GET /` — no auth required. HTML page showing project counts, message stats, and skill inventory.
 
 ---
 
@@ -242,7 +308,7 @@ Both instances share:
 - The same message history
 - The same read cursor (last `get_messages` call from either machine advances it for both)
 
-This also enables cross-machine coordination: an agent on Linux can send a message like "build succeeds on Linux but failing on Windows — user input needed", and you can reply in Discord to direct both agents.
+Skills on the gateway are also accessible from all machines — `claude-mail-skills sync` keeps every machine's skill set up to date.
 
 ---
 
@@ -258,4 +324,4 @@ The read cursor is shared across all agent instances for a project. If a second 
 The bot needs **Manage Channels** permission in your Discord server. Re-invite it using the OAuth2 URL Generator with that permission checked.
 
 **MCP server can't reach the gateway**
-Check that `GATEWAY_URL` is correct and the gateway's port is reachable from the machine running the MCP server. On LAN, ensure your firewall allows the connection.
+Check that `GATEWAY_URL` is correct and the gateway's port (default `7913`) is reachable from the machine running the MCP server. On LAN, ensure your firewall allows the connection.

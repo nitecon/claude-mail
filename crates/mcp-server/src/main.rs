@@ -37,6 +37,8 @@ struct Cli {
 enum Command {
     /// Interactive setup — creates ~/.claude/claude-mail.conf
     Init,
+    /// Check for a newer version and update the binary in place
+    Update,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -126,6 +128,24 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    if let Some(Command::Update) = cli.command {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .context("build http client")?;
+        let current = env!("CARGO_PKG_VERSION");
+        match updater::check_update(&client, current).await? {
+            None => {
+                println!("Already up to date (v{}).", current);
+            }
+            Some(version) => {
+                println!("Updating claude-mail {} -> {}...", current, version);
+                updater::perform_update(&client, &version, "claude-mail").await?;
+            }
+        }
+        return Ok(());
+    }
+
     if let Some(Command::Init) = cli.command {
         return run_init();
     }
@@ -163,6 +183,20 @@ async fn main() -> Result<()> {
                 tracing::warn!("Failed to auto-register default identity '{ident}': {e}");
             }
         }
+    }
+
+    // ── Background update check (non-blocking) ────────────────────────────────
+    {
+        let check_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
+        let current = env!("CARGO_PKG_VERSION");
+        tokio::spawn(async move {
+            if let Ok(Some(v)) = updater::check_update(&check_client, current).await {
+                eprintln!("claude-mail update available: {} (current: {})", v, current);
+            }
+        });
     }
 
     let transport = (stdin(), stdout());
