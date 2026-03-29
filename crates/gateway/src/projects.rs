@@ -73,7 +73,10 @@ mod tests {
     fn strips_git_and_takes_basename() {
         assert_eq!(sanitize_ident("github.com/nitecon/bruce.git"), "bruce");
         assert_eq!(sanitize_ident("/home/user/projects/my-app"), "my-app");
-        assert_eq!(sanitize_ident("C:\\Users\\nitec\\Documents\\Projects\\bruce"), "bruce");
+        assert_eq!(
+            sanitize_ident("C:\\Users\\nitec\\Documents\\Projects\\bruce"),
+            "bruce"
+        );
     }
 
     #[test]

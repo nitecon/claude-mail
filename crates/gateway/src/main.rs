@@ -6,19 +6,14 @@ mod routes;
 
 use anyhow::{Context, Result};
 use axum::{
-    Router,
     extract::{Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
+    Router,
 };
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{sync::mpsc, task::spawn_blocking};
 use tracing::info;
 
@@ -37,11 +32,7 @@ pub struct AppState {
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
 
-async fn bearer_auth(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Response {
+async fn bearer_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let token = request
         .headers()
         .get("authorization")
@@ -71,16 +62,15 @@ fn spawn_inbound_processor(db: Db, mut rx: mpsc::Receiver<PluginEvent>) {
                 let conn = db.lock().unwrap();
 
                 // Resolve room_id → project_ident.
-                let project =
-                    match db::get_project_by_room(&conn, &channel_name, &room_id)? {
-                        Some(p) => p,
-                        None => {
-                            tracing::warn!(
-                                "Received message for unknown room {room_id} on {channel_name}"
-                            );
-                            return Ok::<_, anyhow::Error>(());
-                        }
-                    };
+                let project = match db::get_project_by_room(&conn, &channel_name, &room_id)? {
+                    Some(p) => p,
+                    None => {
+                        tracing::warn!(
+                            "Received message for unknown room {room_id} on {channel_name}"
+                        );
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                };
 
                 let m = db::Message {
                     id: 0,
@@ -120,15 +110,13 @@ async fn main() -> Result<()> {
 
     // ── Config ────────────────────────────────────────────────────────────────
     let api_key = require_env("GATEWAY_API_KEY");
-    let default_channel =
-        std::env::var("DEFAULT_CHANNEL").unwrap_or_else(|_| "discord".into());
+    let default_channel = std::env::var("DEFAULT_CHANNEL").unwrap_or_else(|_| "discord".into());
     let host = std::env::var("GATEWAY_HOST").unwrap_or_else(|_| "0.0.0.0".into());
     let port: u16 = std::env::var("GATEWAY_PORT")
         .unwrap_or_else(|_| "7913".into())
         .parse()
         .context("GATEWAY_PORT must be a u16")?;
-    let db_path =
-        std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/claude-mail.db".into());
+    let db_path = std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/claude-mail.db".into());
     let retention_days: u64 = std::env::var("MESSAGE_RETENTION_DAYS")
         .unwrap_or_else(|_| "30".into())
         .parse()
@@ -157,7 +145,11 @@ async fn main() -> Result<()> {
             .transpose()?;
 
         let discord = Arc::new(channels::discord::DiscordPlugin::new(
-            channels::discord::DiscordConfig { token, guild_id, category_id },
+            channels::discord::DiscordConfig {
+                token,
+                guild_id,
+                category_id,
+            },
         ));
         plugins.insert("discord".into(), discord);
         info!("Registered channel plugin: discord");
@@ -183,7 +175,10 @@ async fn main() -> Result<()> {
             plugin.register_room(&project.room_id, project.last_msg_id.as_deref());
         }
     }
-    info!("Registered {} existing project room(s)", existing_projects.len());
+    info!(
+        "Registered {} existing project room(s)",
+        existing_projects.len()
+    );
 
     // ── Start plugins (connects gateways, spawns background tasks) ────────────
     let (tx, rx) = mpsc::channel::<PluginEvent>(256);

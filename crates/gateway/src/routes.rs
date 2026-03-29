@@ -9,9 +9,9 @@ use tokio::task::spawn_blocking;
 use tracing::error;
 
 use crate::{
-    AppState,
-    db::{self, Message, Project, now_ms},
+    db::{self, now_ms, Message, Project},
     projects::sanitize_ident,
+    AppState,
 };
 
 // ── Error helper ─────────────────────────────────────────────────────────────
@@ -59,7 +59,9 @@ pub async fn register_project(
     Json(body): Json<RegisterProjectRequest>,
 ) -> Result<Json<RegisterProjectResponse>> {
     let project_ident = sanitize_ident(&body.ident);
-    let channel_name = body.channel.unwrap_or_else(|| state.default_channel.clone());
+    let channel_name = body
+        .channel
+        .unwrap_or_else(|| state.default_channel.clone());
 
     // Return existing project immediately (idempotent).
     {
@@ -186,7 +188,10 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
         .iter()
         .map(|p| {
             let unread_cell = if p.unread_count > 0 {
-                format!("<span style='color:#e53e3e;font-weight:600'>{}</span>", p.unread_count)
+                format!(
+                    "<span style='color:#e53e3e;font-weight:600'>{}</span>",
+                    p.unread_count
+                )
             } else {
                 "0".into()
             };

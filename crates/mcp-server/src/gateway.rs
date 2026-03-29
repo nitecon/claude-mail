@@ -64,7 +64,11 @@ impl GatewayClient {
             .timeout(Duration::from_millis(timeout_ms))
             .build()
             .context("build reqwest client")?;
-        Ok(Self { client, base_url, api_key })
+        Ok(Self {
+            client,
+            base_url,
+            api_key,
+        })
     }
 
     fn auth(&self) -> String {

@@ -2,9 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serenity::{
     all::{
-        ChannelId, ChannelType, Context as SerenityCtx, CreateChannel, CreateMessage,
-        EventHandler, GatewayIntents, GetMessages, GuildChannel, GuildId, Message, MessageId,
-        Ready,
+        ChannelId, ChannelType, Context as SerenityCtx, CreateChannel, CreateMessage, EventHandler,
+        GatewayIntents, GetMessages, GuildChannel, GuildId, Message, MessageId, Ready,
     },
     Client,
 };
@@ -56,7 +55,9 @@ impl DiscordPlugin {
     }
 
     fn http(&self) -> &std::sync::Arc<serenity::http::Http> {
-        self.http.get().expect("DiscordPlugin::start() must be called before HTTP operations")
+        self.http
+            .get()
+            .expect("DiscordPlugin::start() must be called before HTTP operations")
     }
 }
 
@@ -160,7 +161,9 @@ impl ChannelPlugin for DiscordPlugin {
         let builder = match after_id {
             Some(after) => {
                 let snowflake: u64 = after.parse().context("parse after_id snowflake")?;
-                GetMessages::new().after(MessageId::new(snowflake)).limit(100)
+                GetMessages::new()
+                    .after(MessageId::new(snowflake))
+                    .limit(100)
             }
             None => GetMessages::new().limit(100),
         };

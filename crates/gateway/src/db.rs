@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use std::sync::{Arc, Mutex};
 
 pub type Db = Arc<Mutex<Connection>>;
@@ -99,7 +99,13 @@ pub fn insert_project(conn: &Connection, p: &Project) -> Result<()> {
         "INSERT INTO projects (ident, channel_name, room_id, last_msg_id, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(ident) DO NOTHING",
-        params![p.ident, p.channel_name, p.room_id, p.last_msg_id, p.created_at],
+        params![
+            p.ident,
+            p.channel_name,
+            p.room_id,
+            p.last_msg_id,
+            p.created_at
+        ],
     )?;
     conn.execute(
         "INSERT INTO cursors (project_ident, last_read_id, updated_at)
@@ -244,10 +250,8 @@ pub struct DashboardData {
 }
 
 pub fn get_dashboard_data(conn: &Connection) -> Result<DashboardData> {
-    let project_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))?;
-    let total_messages: i64 =
-        conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?;
+    let project_count: i64 = conn.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))?;
+    let total_messages: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?;
     let agent_messages: i64 = conn.query_row(
         "SELECT COUNT(*) FROM messages WHERE source='agent'",
         [],

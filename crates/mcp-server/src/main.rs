@@ -63,11 +63,14 @@ fn run_init() -> Result<()> {
 
     let url = {
         let v = prompt("Gateway URL [http://localhost:7913]: ")?;
-        if v.is_empty() { "http://localhost:7913".to_string() } else { v }
+        if v.is_empty() {
+            "http://localhost:7913".to_string()
+        } else {
+            v
+        }
     };
 
-    let api_key = rpassword::prompt_password("Gateway API key: ")
-        .context("read API key")?;
+    let api_key = rpassword::prompt_password("Gateway API key: ").context("read API key")?;
     if api_key.is_empty() {
         anyhow::bail!("API key cannot be empty");
     }
@@ -76,7 +79,11 @@ fn run_init() -> Result<()> {
 
     let timeout_ms = {
         let v = prompt("HTTP timeout ms [5000]: ")?;
-        if v.is_empty() { "5000".to_string() } else { v }
+        if v.is_empty() {
+            "5000".to_string()
+        } else {
+            v
+        }
     };
 
     // Write config file.
@@ -84,9 +91,8 @@ fn run_init() -> Result<()> {
     std::fs::create_dir_all(&claude_dir).context("create ~/.claude directory")?;
     let conf_path = claude_dir.join("claude-mail.conf");
 
-    let mut conf = format!(
-        "GATEWAY_URL={url}\nGATEWAY_API_KEY={api_key}\nGATEWAY_TIMEOUT_MS={timeout_ms}\n"
-    );
+    let mut conf =
+        format!("GATEWAY_URL={url}\nGATEWAY_API_KEY={api_key}\nGATEWAY_TIMEOUT_MS={timeout_ms}\n");
     if !default_project.is_empty() {
         conf.push_str(&format!("DEFAULT_PROJECT_IDENT={default_project}\n"));
     }
