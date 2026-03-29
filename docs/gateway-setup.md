@@ -5,11 +5,9 @@
 To set up claude-mail on linux we first have to create the user for the service to run as use the following:
 
 ```bash
-useradd -m -d /etc/cmail --shell /bin/false cmail
-mkdir -p /etc/cmail
-chown -R cmail:cmail /etc/cmail
-mkdir -p /var/lib/claude-mail
-chown -R cmail:cmail /var/lib/claude-mail
+sudo useradd --system --no-create-home --shell /bin/false cmail
+sudo mkdir -p /etc/cmail /var/lib/claude-mail
+sudo chown -R cmail:cmail /etc/cmail /var/lib/claude-mail
 ```
 
 As seen above we also create the var lib directory for app storage.
