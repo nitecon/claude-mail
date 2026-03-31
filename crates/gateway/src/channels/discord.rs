@@ -302,9 +302,8 @@ impl EventHandler for DiscordHandler {
                     .channel_id
                     .send_message(
                         &ctx.http,
-                        CreateMessage::new().content(
-                            "This is not a project channel — I don't forward mail here.",
-                        ),
+                        CreateMessage::new()
+                            .content("This is not a project channel — I don't forward mail here."),
                     )
                     .await
                 {

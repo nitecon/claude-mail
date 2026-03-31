@@ -29,6 +29,14 @@ struct SendMessageParams {
     content: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ConfirmReadParams {
+    #[schemars(
+        description = "The numeric message ID to confirm as read. Get this from the get_messages output."
+    )]
+    message_id: i64,
+}
+
 // ── Session state ─────────────────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -108,9 +116,9 @@ impl MailServer {
         }
     }
 
-    /// Get unread messages from the project's channel since the last call.
+    /// Get unconfirmed messages from the project's channel.
     #[tool(
-        description = "Get unread messages from the project's channel since the last call. Returns '[AGENT]' and '[USER]' prefixed lines, or 'no messages'. set_identity must be called first."
+        description = "Get unconfirmed messages from the project's channel. Returns messages with their IDs. You MUST call confirm_read for each message after you have read and acted on it. Messages will keep reappearing until confirmed. set_identity must be called first."
     )]
     async fn get_messages(&self) -> String {
         let ident = {
@@ -127,7 +135,8 @@ impl MailServer {
                 if resp.messages.is_empty() {
                     return "no messages".to_string();
                 }
-                resp.messages
+                let mut lines: Vec<String> = resp
+                    .messages
                     .iter()
                     .map(|m| {
                         let prefix = if m.source == "agent" {
@@ -135,12 +144,51 @@ impl MailServer {
                         } else {
                             "[USER]"
                         };
-                        format!("{} {}", prefix, m.content)
+                        format!("(id={}) {} {}", m.id, prefix, m.content)
                     })
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                    .collect();
+                lines.push(String::new());
+                lines.push(
+                    "IMPORTANT: You MUST call confirm_read for each message above \
+                     (by its id) after you have read and acted on it. \
+                     Unconfirmed messages will reappear on the next get_messages call."
+                        .to_string(),
+                );
+                lines.join("\n")
             }
             Err(e) => format!("Error fetching messages: {}", e),
+        }
+    }
+
+    /// Confirm that a message has been read and acted upon.
+    #[tool(
+        description = "Confirm that you have read and acted on a specific message. You MUST call this for every message returned by get_messages after you have handled it. Pass the numeric message_id from the get_messages output. Messages will keep reappearing in get_messages until confirmed."
+    )]
+    async fn confirm_read(
+        &self,
+        Parameters(ConfirmReadParams { message_id }): Parameters<ConfirmReadParams>,
+    ) -> String {
+        let ident = {
+            let s = self.session.lock().unwrap();
+            s.ident.clone()
+        };
+
+        let Some(ident) = ident else {
+            return "Error: identity not set. Call set_identity first.".to_string();
+        };
+
+        match self.gateway.confirm_read(&ident, message_id).await {
+            Ok(resp) => {
+                if resp.confirmed {
+                    format!("Message {} confirmed as read.", message_id)
+                } else {
+                    format!(
+                        "Message {} was already confirmed or does not exist.",
+                        message_id
+                    )
+                }
+            }
+            Err(e) => format!("Error confirming message: {}", e),
         }
     }
 }
@@ -160,7 +208,9 @@ impl ServerHandler for MailServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "claude-mail: communicate with the user via a configured channel (Discord, Slack, \
                  email, etc.). Call set_identity first (once per session), then use send_message \
-                 to notify the user and get_messages to poll for replies."
+                 to notify the user and get_messages to poll for replies. \
+                 IMPORTANT: After calling get_messages, you MUST call confirm_read for each \
+                 message to acknowledge it. Unconfirmed messages will keep reappearing."
                 .to_string(),
         )
     }

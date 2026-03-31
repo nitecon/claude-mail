@@ -26,6 +26,8 @@ pub struct Message {
     pub external_message_id: Option<String>,
     pub content: String,
     pub sent_at: i64,
+    /// Timestamp (ms) when the agent confirmed this message, or None if unconfirmed.
+    pub confirmed_at: Option<i64>,
 }
 
 pub fn open(path: &str) -> Result<Db> {
@@ -74,7 +76,31 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             uploaded_at INTEGER NOT NULL
         );",
     )
-    .context("apply schema")
+    .context("apply schema")?;
+
+    // ── Migration: add per-message confirmation column ────────────────────────
+    // Idempotent: ALTER fails silently if the column already exists.
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN confirmed_at INTEGER", []);
+
+    // Migrate old cursor state: mark all previously-read messages as confirmed.
+    conn.execute(
+        "UPDATE messages SET confirmed_at = sent_at
+         WHERE confirmed_at IS NULL
+           AND id <= (
+               SELECT COALESCE(c.last_read_id, 0)
+               FROM cursors c
+               WHERE c.project_ident = messages.project_ident
+           )",
+        [],
+    )?;
+
+    // Partial index for fast unconfirmed-message lookups.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_messages_unconfirmed
+             ON messages(project_ident, id) WHERE confirmed_at IS NULL;",
+    )?;
+
+    Ok(())
 }
 
 // ── Projects ─────────────────────────────────────────────────────────────────
@@ -155,55 +181,50 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
 // ── Messages ─────────────────────────────────────────────────────────────────
 
 pub fn insert_message(conn: &Connection, m: &Message) -> Result<i64> {
+    // Agent messages are auto-confirmed at insert time so they never appear in
+    // the unconfirmed queue — the agent already knows what it sent.
+    let confirmed_at = if m.source == "agent" {
+        Some(now_ms())
+    } else {
+        None
+    };
     conn.execute(
-        "INSERT INTO messages (project_ident, source, external_message_id, content, sent_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO messages (project_ident, source, external_message_id, content, sent_at, confirmed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             m.project_ident,
             m.source,
             m.external_message_id,
             m.content,
-            m.sent_at
+            m.sent_at,
+            confirmed_at
         ],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
-/// Returns unread messages and advances the cursor atomically (BEGIN IMMEDIATE).
-pub fn get_and_advance_cursor(conn: &Connection, ident: &str) -> Result<Vec<Message>> {
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+/// Returns all unconfirmed messages for a project (peek — no side effects).
+pub fn get_unconfirmed_messages(conn: &Connection, ident: &str) -> Result<Vec<Message>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, project_ident, source, external_message_id, content, sent_at, confirmed_at
+         FROM messages
+         WHERE project_ident = ?1 AND confirmed_at IS NULL
+         ORDER BY id ASC",
+    )?;
+    let collected = stmt
+        .query_map(params![ident], row_to_message)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(collected)
+}
 
-    let cursor: i64 = conn
-        .query_row(
-            "SELECT last_read_id FROM cursors WHERE project_ident = ?1",
-            params![ident],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-
-    let msgs: Vec<Message> = {
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, project_ident, source, external_message_id, content, sent_at
-             FROM messages
-             WHERE project_ident = ?1 AND id > ?2
-             ORDER BY id ASC",
-        )?;
-        let collected = stmt
-            .query_map(params![ident, cursor], row_to_message)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        collected
-    };
-
-    if let Some(last) = msgs.last() {
-        let now = now_ms();
-        conn.execute(
-            "UPDATE cursors SET last_read_id = ?1, updated_at = ?2 WHERE project_ident = ?3",
-            params![last.id, now, ident],
-        )?;
-    }
-
-    conn.execute_batch("COMMIT")?;
-    Ok(msgs)
+/// Mark a single message as confirmed. Returns true if the message was unconfirmed and is now confirmed.
+pub fn confirm_message(conn: &Connection, project_ident: &str, msg_id: i64) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE messages SET confirmed_at = ?1
+         WHERE id = ?2 AND project_ident = ?3 AND confirmed_at IS NULL",
+        params![now_ms(), msg_id, project_ident],
+    )?;
+    Ok(n > 0)
 }
 
 fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
@@ -214,6 +235,7 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         external_message_id: row.get(3)?,
         content: row.get(4)?,
         sent_at: row.get(5)?,
+        confirmed_at: row.get(6)?,
     })
 }
 
@@ -223,10 +245,7 @@ pub fn purge_old_messages(conn: &Connection, cutoff_ms: i64) -> Result<usize> {
     let n = conn.execute(
         "DELETE FROM messages
          WHERE sent_at < ?1
-           AND id <= (
-               SELECT last_read_id FROM cursors
-               WHERE project_ident = messages.project_ident
-           )",
+           AND confirmed_at IS NOT NULL",
         params![cutoff_ms],
     )?;
     Ok(n)
@@ -278,8 +297,7 @@ pub fn get_dashboard_data(conn: &Connection) -> Result<DashboardData> {
                 COUNT(m.id),
                 (SELECT COUNT(*) FROM messages m2
                  WHERE m2.project_ident = p.ident
-                   AND m2.id > COALESCE(
-                         (SELECT last_read_id FROM cursors WHERE project_ident = p.ident), 0)
+                   AND m2.confirmed_at IS NULL
                    AND m2.source = 'user')
          FROM projects p
          LEFT JOIN messages m ON m.project_ident = p.ident

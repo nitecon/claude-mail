@@ -79,6 +79,7 @@ fn spawn_inbound_processor(db: Db, mut rx: mpsc::Receiver<PluginEvent>) {
                     external_message_id: Some(message.id.clone()),
                     content: message.content,
                     sent_at: db::now_ms(),
+                    confirmed_at: None,
                 };
                 db::insert_message(&conn, &m)?;
                 db::update_last_msg_id(&conn, &project.ident, &message.id)?;
@@ -260,6 +261,10 @@ async fn main() -> Result<()> {
         .route(
             "/v1/projects/{ident}/messages/unread",
             get(routes::get_unread_messages),
+        )
+        .route(
+            "/v1/projects/{ident}/messages/{id}/confirm",
+            post(routes::confirm_message),
         )
         .route("/v1/skills", get(routes::list_skills_handler))
         .route(

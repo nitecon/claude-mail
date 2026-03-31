@@ -56,6 +56,11 @@ pub struct GetUnreadResponse {
     pub status: String,
 }
 
+#[derive(Deserialize)]
+pub struct ConfirmResponse {
+    pub confirmed: bool,
+}
+
 // ── Client implementation ─────────────────────────────────────────────────────
 
 impl GatewayClient {
@@ -126,7 +131,7 @@ impl GatewayClient {
             .context("decode send message response")
     }
 
-    /// Fetch and advance unread messages for a project.
+    /// Fetch unconfirmed messages for a project (peek — no side effects).
     pub async fn get_unread(&self, ident: &str) -> Result<GetUnreadResponse> {
         let url = format!("{}/v1/projects/{}/messages/unread", self.base_url, ident);
         let resp = self
@@ -146,5 +151,30 @@ impl GatewayClient {
         resp.json::<GetUnreadResponse>()
             .await
             .context("decode unread response")
+    }
+
+    /// Confirm a single message as read and acted upon.
+    pub async fn confirm_read(&self, ident: &str, msg_id: i64) -> Result<ConfirmResponse> {
+        let url = format!(
+            "{}/v1/projects/{}/messages/{}/confirm",
+            self.base_url, ident, msg_id
+        );
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", self.auth())
+            .send()
+            .await
+            .context("POST /v1/projects/:ident/messages/:id/confirm")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("gateway error {status}: {body}");
+        }
+
+        resp.json::<ConfirmResponse>()
+            .await
+            .context("decode confirm response")
     }
 }

@@ -164,6 +164,7 @@ pub async fn send_message(
         external_message_id: Some(external_id.clone()),
         content: body.content,
         sent_at: now_ms(),
+        confirmed_at: None, // insert_message auto-confirms agent messages
     };
 
     let db = state.db.clone();
@@ -411,15 +412,47 @@ pub async fn get_unread_messages(
     let ident_clone = ident.clone();
     let messages = spawn_blocking(move || {
         let conn = db.lock().unwrap();
-        db::get_and_advance_cursor(&conn, &ident_clone)
+        db::get_unconfirmed_messages(&conn, &ident_clone)
     })
     .await??;
 
     let status = if messages.is_empty() {
         "no messages".to_string()
     } else {
-        format!("{} message(s)", messages.len())
+        format!("{} unconfirmed message(s)", messages.len())
     };
 
     Ok(Json(GetUnreadResponse { messages, status }))
+}
+
+// ── POST /v1/projects/:ident/messages/:id/confirm ────────────────────────────
+
+#[derive(Serialize)]
+pub struct ConfirmResponse {
+    pub confirmed: bool,
+}
+
+pub async fn confirm_message(
+    State(state): State<AppState>,
+    Path((ident, msg_id)): Path<(String, i64)>,
+) -> Result<Json<ConfirmResponse>> {
+    {
+        let conn = state.db.lock().unwrap();
+        if db::get_project(&conn, &ident)?.is_none() {
+            return Err(AppError(
+                StatusCode::NOT_FOUND,
+                format!("project '{}' not found", ident),
+            ));
+        }
+    }
+
+    let db = state.db.clone();
+    let ident_clone = ident.clone();
+    let confirmed = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::confirm_message(&conn, &ident_clone, msg_id)
+    })
+    .await??;
+
+    Ok(Json(ConfirmResponse { confirmed }))
 }
