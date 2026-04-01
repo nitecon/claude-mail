@@ -273,11 +273,13 @@ async fn main() -> Result<()> {
                 .get(routes::download_skill)
                 .delete(routes::delete_skill_handler),
         )
+        .route("/v1/skills/{name}/content", get(routes::get_skill_content))
         .layer(middleware::from_fn_with_state(state.clone(), bearer_auth));
 
-    // Dashboard at / is public (local admin page, no auth required).
+    // Dashboard and manage page are public (local admin pages, no auth required).
     let app = Router::new()
         .route("/", get(routes::dashboard))
+        .route("/manage", get(routes::manage_page))
         .merge(api)
         .with_state(state);
 

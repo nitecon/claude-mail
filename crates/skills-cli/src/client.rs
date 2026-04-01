@@ -6,6 +6,7 @@ use std::time::Duration;
 #[derive(Debug, Clone, Deserialize)]
 pub struct SkillMeta {
     pub name: String,
+    pub kind: String,
     pub size: i64,
     pub checksum: String,
     pub uploaded_at: i64,
@@ -15,8 +16,15 @@ pub struct SkillMeta {
 #[allow(dead_code)]
 pub struct UploadResponse {
     pub name: String,
+    pub kind: String,
     pub size: i64,
     pub checksum: String,
+}
+
+pub struct DownloadResult {
+    pub bytes: Vec<u8>,
+    /// "skill", "command", or "agent"
+    pub kind: String,
 }
 
 pub struct SkillsClient {
@@ -57,7 +65,47 @@ impl SkillsClient {
             .context("parse upload response")
     }
 
-    pub async fn download(&self, name: &str) -> Result<Vec<u8>> {
+    pub async fn upload_command(&self, name: &str, markdown: String) -> Result<UploadResponse> {
+        let url = format!("{}/v1/skills/{}", self.base_url, name);
+        let resp = self
+            .client
+            .put(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "text/markdown")
+            .header("X-Kind", "command")
+            .body(markdown)
+            .send()
+            .await
+            .context("upload command")?;
+        if !resp.status().is_success() {
+            bail!("upload failed: HTTP {}", resp.status());
+        }
+        resp.json::<UploadResponse>()
+            .await
+            .context("parse upload response")
+    }
+
+    pub async fn upload_agent(&self, name: &str, markdown: String) -> Result<UploadResponse> {
+        let url = format!("{}/v1/skills/{}", self.base_url, name);
+        let resp = self
+            .client
+            .put(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "text/markdown")
+            .header("X-Kind", "agent")
+            .body(markdown)
+            .send()
+            .await
+            .context("upload agent")?;
+        if !resp.status().is_success() {
+            bail!("upload failed: HTTP {}", resp.status());
+        }
+        resp.json::<UploadResponse>()
+            .await
+            .context("parse upload response")
+    }
+
+    pub async fn download(&self, name: &str) -> Result<DownloadResult> {
         let url = format!("{}/v1/skills/{}", self.base_url, name);
         let resp = self
             .client
@@ -67,15 +115,36 @@ impl SkillsClient {
             .await
             .context("download skill")?;
         if resp.status() == StatusCode::NOT_FOUND {
-            bail!("skill '{}' not found on gateway", name);
+            bail!("'{}' not found on gateway", name);
         }
         if !resp.status().is_success() {
             bail!("download failed: HTTP {}", resp.status());
         }
-        resp.bytes()
+        // X-Kind header is authoritative; fall back to Content-Type detection.
+        let kind = resp
+            .headers()
+            .get("x-kind")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+            .unwrap_or_else(|| {
+                let is_md = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|ct| ct.starts_with("text/markdown"))
+                    .unwrap_or(false);
+                if is_md {
+                    "command".to_string()
+                } else {
+                    "skill".to_string()
+                }
+            });
+        let bytes = resp
+            .bytes()
             .await
             .map(|b| b.to_vec())
-            .context("read response bytes")
+            .context("read response bytes")?;
+        Ok(DownloadResult { bytes, kind })
     }
 
     pub async fn list(&self) -> Result<Vec<SkillMeta>> {

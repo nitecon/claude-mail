@@ -100,6 +100,13 @@ fn apply_schema(conn: &Connection) -> Result<()> {
              ON messages(project_ident, id) WHERE confirmed_at IS NULL;",
     )?;
 
+    // ── Migration: add kind/content columns for command support ───────────────
+    let _ = conn.execute(
+        "ALTER TABLE skills ADD COLUMN kind TEXT NOT NULL DEFAULT 'skill'",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE skills ADD COLUMN content TEXT", []);
+
     Ok(())
 }
 
@@ -330,7 +337,11 @@ pub fn get_dashboard_data(conn: &Connection) -> Result<DashboardData> {
 
 pub struct SkillRecord {
     pub name: String,
+    /// "skill", "command", or "agent"
+    pub kind: String,
     pub zip_data: Vec<u8>,
+    /// Raw markdown content for commands; None for skills.
+    pub content: Option<String>,
     pub size: i64,
     pub checksum: String,
     pub uploaded_at: i64,
@@ -339,6 +350,7 @@ pub struct SkillRecord {
 #[derive(serde::Serialize)]
 pub struct SkillMeta {
     pub name: String,
+    pub kind: String,
     pub size: i64,
     pub checksum: String,
     pub uploaded_at: i64,
@@ -346,44 +358,58 @@ pub struct SkillMeta {
 
 pub fn upsert_skill(conn: &Connection, r: &SkillRecord) -> Result<()> {
     conn.execute(
-        "INSERT INTO skills (name, zip_data, size, checksum, uploaded_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO skills (name, kind, zip_data, content, size, checksum, uploaded_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(name) DO UPDATE SET
+             kind = excluded.kind,
              zip_data = excluded.zip_data,
+             content = excluded.content,
              size = excluded.size,
              checksum = excluded.checksum,
              uploaded_at = excluded.uploaded_at",
-        params![r.name, r.zip_data, r.size, r.checksum, r.uploaded_at],
+        params![
+            r.name,
+            r.kind,
+            r.zip_data,
+            r.content,
+            r.size,
+            r.checksum,
+            r.uploaded_at
+        ],
     )?;
     Ok(())
 }
 
 pub fn get_skill(conn: &Connection, name: &str) -> Result<Option<SkillRecord>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT name, zip_data, size, checksum, uploaded_at FROM skills WHERE name = ?1",
+        "SELECT name, kind, zip_data, content, size, checksum, uploaded_at FROM skills WHERE name = ?1",
     )?;
     let mut rows = stmt.query_map(params![name], |r| {
         Ok(SkillRecord {
             name: r.get(0)?,
-            zip_data: r.get(1)?,
-            size: r.get(2)?,
-            checksum: r.get(3)?,
-            uploaded_at: r.get(4)?,
+            kind: r.get(1)?,
+            zip_data: r.get(2)?,
+            content: r.get(3)?,
+            size: r.get(4)?,
+            checksum: r.get(5)?,
+            uploaded_at: r.get(6)?,
         })
     })?;
     Ok(rows.next().transpose()?)
 }
 
 pub fn list_skills(conn: &Connection) -> Result<Vec<SkillMeta>> {
-    let mut stmt = conn
-        .prepare_cached("SELECT name, size, checksum, uploaded_at FROM skills ORDER BY name ASC")?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT name, kind, size, checksum, uploaded_at FROM skills ORDER BY kind ASC, name ASC",
+    )?;
     let collected = stmt
         .query_map([], |r| {
             Ok(SkillMeta {
                 name: r.get(0)?,
-                size: r.get(1)?,
-                checksum: r.get(2)?,
-                uploaded_at: r.get(3)?,
+                kind: r.get(1)?,
+                size: r.get(2)?,
+                checksum: r.get(3)?,
+                uploaded_at: r.get(4)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
