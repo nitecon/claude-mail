@@ -10,8 +10,8 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    name = "sync",
-    about = "Sync shared Claude Code skills and data with the gateway"
+    name = "agent-sync",
+    about = "Sync skills, commands, and agents with the agent-comms gateway"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -37,43 +37,52 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Zip and upload a skill directory (must contain SKILL.md)
-    Push {
-        /// Path to the skill directory
-        skill_dir: PathBuf,
+    /// Manage skills (directories or single files)
+    Skills {
+        #[command(subcommand)]
+        action: ResourceAction,
     },
-    /// Upload a single markdown file as a command
-    PushCmd {
-        /// Path to the .md file
-        file: PathBuf,
+    /// Manage commands (.md files)
+    Commands {
+        #[command(subcommand)]
+        action: ResourceAction,
     },
-    /// Upload a single markdown file as an agent
-    PushAgent {
-        /// Path to the .md file
-        file: PathBuf,
+    /// Manage agents (.md files)
+    Agents {
+        #[command(subcommand)]
+        action: ResourceAction,
     },
-    /// Download and extract a skill, command, or agent from the gateway
-    Pull {
-        /// Name of the skill, command, or agent
-        name: String,
-        /// Directory to extract into (default: current directory)
-        #[arg(long, default_value = ".")]
-        to: PathBuf,
-    },
-    /// List all skills, commands, and agents on the gateway
-    List,
-    /// Delete a skill, command, or agent from the gateway
-    Delete {
-        /// Name of the skill, command, or agent
-        name: String,
-    },
-    /// Check for a newer version and update the binary in place
-    Update,
     /// Bidirectional sync: push new/changed local skills, commands, and agents; pull new remote ones
     Sync {
         /// Root directory containing skill subdirectories and command .md files (default: current directory)
         #[arg(long, default_value = ".")]
         dir: PathBuf,
+    },
+    /// Check for a newer version and update the binary in place
+    Update,
+}
+
+#[derive(Subcommand)]
+enum ResourceAction {
+    /// Push a resource to the gateway
+    Push {
+        /// Path to skill directory, or .md file
+        path: PathBuf,
+    },
+    /// Pull a resource from the gateway
+    Pull {
+        /// Name of the resource
+        name: String,
+        /// Destination directory
+        #[arg(long, default_value = ".")]
+        to: PathBuf,
+    },
+    /// List resources on the gateway
+    List,
+    /// Delete a resource from the gateway
+    Delete {
+        /// Name of the resource
+        name: String,
     },
 }
 
@@ -86,9 +95,9 @@ fn home_dir() -> PathBuf {
         .expect("could not determine home directory")
 }
 
-/// Sanitize a skill directory basename into a valid gateway skill name.
-/// Same rules as gateway's sanitize_ident: lowercase, [a-z0-9_-] only,
-/// no leading/trailing hyphens, max 100 chars.
+/// Sanitize a resource name into a valid gateway identifier.
+/// Rules: lowercase, [a-z0-9_-] only, no leading/trailing hyphens,
+/// collapsed consecutive hyphens, max 100 chars.
 fn sanitize_name(raw: &str) -> String {
     let lower = raw.to_lowercase();
     let replaced: String = lower
@@ -140,127 +149,165 @@ fn require_client(
     SkillsClient::new(url, api_key, timeout_ms)
 }
 
-// ── Commands ──────────────────────────────────────────────────────────────────
+// ── Resource Commands ────────────────────────────────────────────────────────
 
-async fn cmd_push(client: &SkillsClient, skill_dir: PathBuf) -> Result<()> {
-    let skill_dir = skill_dir
-        .canonicalize()
-        .context("resolve skill directory")?;
-    if !skill_dir.join("SKILL.md").exists() {
-        bail!(
-            "'{}' does not contain SKILL.md — not a valid skill directory",
-            skill_dir.display()
-        );
-    }
-    let name = sanitize_name(
-        skill_dir
-            .file_name()
+/// Handle push for all resource types with smart file/directory detection.
+async fn cmd_resource_push(client: &SkillsClient, path: PathBuf, kind: &str) -> Result<()> {
+    let path = path.canonicalize().context("resolve path")?;
+
+    if kind == "skill" {
+        if path.is_dir() {
+            // Directory push: zip and upload (requires SKILL.md).
+            if !path.join("SKILL.md").exists() {
+                bail!(
+                    "'{}' does not contain SKILL.md — not a valid skill directory",
+                    path.display()
+                );
+            }
+            let name = sanitize_name(
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .context("skill directory has no name")?,
+            );
+            if name.is_empty() {
+                bail!(
+                    "could not derive a valid skill name from directory '{}'",
+                    path.display()
+                );
+            }
+            let (zip_bytes, checksum) = zip_util::zip_skill_dir(&path).context("zip skill")?;
+            let size = zip_bytes.len();
+            client.upload(&name, zip_bytes).await?;
+            println!(
+                "Pushed skill '{}' ({} bytes, checksum: {})",
+                name,
+                size,
+                &checksum[..12]
+            );
+        } else if path.is_file() {
+            // Single file push: upload as text/markdown with skill kind.
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext != "md" {
+                bail!("skill file must have .md extension, got '.{}'", ext);
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|n| n.to_str())
+                .context("file has no name")?;
+            let name = sanitize_name(stem);
+            if name.is_empty() {
+                bail!(
+                    "could not derive a valid skill name from '{}'",
+                    path.display()
+                );
+            }
+            let content = std::fs::read_to_string(&path).context("read skill file")?;
+            if content.is_empty() {
+                bail!("skill file is empty");
+            }
+            let size = content.len();
+            // Upload single-file skill using the skill upload (zip) path:
+            // wrap the single file in a zip so the gateway treats it as a skill.
+            let (zip_bytes, checksum) =
+                zip_util::zip_single_file(&path).context("zip single skill file")?;
+            client.upload(&name, zip_bytes).await?;
+            println!(
+                "Pushed skill '{}' ({} bytes raw, checksum: {})",
+                name,
+                size,
+                &checksum[..12]
+            );
+        } else {
+            bail!("'{}' is neither a file nor a directory", path.display());
+        }
+    } else {
+        // Commands and agents: must be a .md file.
+        if !path.is_file() {
+            bail!("{} push requires a file, got directory", kind);
+        }
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext != "md" {
+            bail!("{} file must have .md extension, got '.{}'", kind, ext);
+        }
+        let stem = path
+            .file_stem()
             .and_then(|n| n.to_str())
-            .context("skill directory has no name")?,
-    );
-    if name.is_empty() {
-        bail!(
-            "could not derive a valid skill name from directory '{}'",
-            skill_dir.display()
-        );
+            .context("file has no name")?;
+        let name = sanitize_name(stem);
+        if name.is_empty() {
+            bail!(
+                "could not derive a valid {} name from '{}'",
+                kind,
+                path.display()
+            );
+        }
+        let markdown = std::fs::read_to_string(&path).context("read file")?;
+        if markdown.is_empty() {
+            bail!("{} file is empty", kind);
+        }
+        let size = markdown.len();
+        match kind {
+            "command" => client.upload_command(&name, markdown).await?,
+            "agent" => client.upload_agent(&name, markdown).await?,
+            _ => unreachable!(),
+        };
+        println!("Pushed {} '{}' ({} bytes)", kind, name, size);
     }
-
-    let (zip_bytes, checksum) = zip_util::zip_skill_dir(&skill_dir).context("zip skill")?;
-    let size = zip_bytes.len();
-    client.upload(&name, zip_bytes).await?;
-    println!(
-        "Pushed '{}' ({} bytes, checksum: {})",
-        name,
-        size,
-        &checksum[..12]
-    );
     Ok(())
 }
 
-async fn cmd_push_command(client: &SkillsClient, file: PathBuf) -> Result<()> {
-    let file = file.canonicalize().context("resolve command file")?;
-    if !file.is_file() {
-        bail!("'{}' is not a file", file.display());
-    }
-    let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
-    if ext != "md" {
-        bail!("command file must have .md extension, got '.{}'", ext);
-    }
-
-    let stem = file
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .context("file has no name")?;
-    let name = sanitize_name(stem);
-    if name.is_empty() {
-        bail!(
-            "could not derive a valid command name from '{}'",
-            file.display()
-        );
-    }
-
-    let markdown = std::fs::read_to_string(&file).context("read command file")?;
-    if markdown.is_empty() {
-        bail!("command file is empty");
-    }
-    let size = markdown.len();
-    client.upload_command(&name, markdown).await?;
-    println!("Pushed command '{}' ({} bytes)", name, size);
-    Ok(())
-}
-
-async fn cmd_push_agent(client: &SkillsClient, file: PathBuf) -> Result<()> {
-    let file = file.canonicalize().context("resolve agent file")?;
-    if !file.is_file() {
-        bail!("'{}' is not a file", file.display());
-    }
-    let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
-    if ext != "md" {
-        bail!("agent file must have .md extension, got '.{}'", ext);
-    }
-
-    let stem = file
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .context("file has no name")?;
-    let name = sanitize_name(stem);
-    if name.is_empty() {
-        bail!(
-            "could not derive a valid agent name from '{}'",
-            file.display()
-        );
-    }
-
-    let markdown = std::fs::read_to_string(&file).context("read agent file")?;
-    if markdown.is_empty() {
-        bail!("agent file is empty");
-    }
-    let size = markdown.len();
-    client.upload_agent(&name, markdown).await?;
-    println!("Pushed agent '{}' ({} bytes)", name, size);
-    Ok(())
-}
-
-async fn cmd_pull(client: &SkillsClient, name: String, to: PathBuf) -> Result<()> {
+/// Pull a resource from the gateway, respecting its kind.
+async fn cmd_resource_pull(
+    client: &SkillsClient,
+    name: String,
+    to: PathBuf,
+    kind: &str,
+) -> Result<()> {
     let result = client.download(&name).await?;
-    match result.kind.as_str() {
+
+    // Verify the downloaded resource matches the expected kind.
+    let actual_kind = result.kind.as_str();
+    let kind_matches = match kind {
+        "skill" => actual_kind != "command" && actual_kind != "agent",
+        other => actual_kind == other,
+    };
+    if !kind_matches {
+        bail!(
+            "'{}' is a {} on the gateway, not a {}",
+            name,
+            actual_kind,
+            kind
+        );
+    }
+
+    match kind {
+        "skill" => {
+            let dest = zip_util::unzip_skill(&name, &result.bytes, &to)?;
+            println!("Pulled skill '{}' -> {}", name, dest.display());
+        }
         "command" | "agent" => {
             let dest = to.join(format!("{}.md", name));
             std::fs::write(&dest, &result.bytes).context("write file")?;
-            println!("Pulled {} '{}' → {}", result.kind, name, dest.display());
+            println!("Pulled {} '{}' -> {}", kind, name, dest.display());
         }
-        _ => {
-            let dest = zip_util::unzip_skill(&name, &result.bytes, &to)?;
-            println!("Pulled skill '{}' → {}", name, dest.display());
-        }
+        _ => unreachable!(),
     }
     Ok(())
 }
 
-async fn cmd_list(client: &SkillsClient) -> Result<()> {
-    let skills = client.list().await?;
-    if skills.is_empty() {
-        println!("No skills or commands on gateway.");
+/// List resources on the gateway, filtered by kind.
+async fn cmd_resource_list(client: &SkillsClient, kind: &str) -> Result<()> {
+    let all = client.list().await?;
+    let filtered: Vec<_> = all
+        .into_iter()
+        .filter(|s| match kind {
+            "skill" => s.kind != "command" && s.kind != "agent",
+            other => s.kind == other,
+        })
+        .collect();
+
+    if filtered.is_empty() {
+        println!("No {}s on gateway.", kind);
         return Ok(());
     }
     println!(
@@ -268,7 +315,7 @@ async fn cmd_list(client: &SkillsClient) -> Result<()> {
         "NAME", "KIND", "SIZE", "CHECKSUM"
     );
     println!("{}", "-".repeat(80));
-    for s in &skills {
+    for s in &filtered {
         let ts = chrono_or_raw(s.uploaded_at);
         println!(
             "{:<30} {:<8} {:>10}  {:<14}  {}",
@@ -282,17 +329,34 @@ async fn cmd_list(client: &SkillsClient) -> Result<()> {
     Ok(())
 }
 
+/// Delete a resource from the gateway.
+async fn cmd_resource_delete(client: &SkillsClient, name: String) -> Result<()> {
+    client.delete(&name).await?;
+    println!("Deleted '{}'", name);
+    Ok(())
+}
+
+/// Dispatch a resource action to the appropriate handler.
+async fn handle_resource(action: ResourceAction, client: &SkillsClient, kind: &str) -> Result<()> {
+    match action {
+        ResourceAction::Push { path } => cmd_resource_push(client, path, kind).await,
+        ResourceAction::Pull { name, to } => cmd_resource_pull(client, name, to, kind).await,
+        ResourceAction::List => cmd_resource_list(client, kind).await,
+        ResourceAction::Delete { name } => cmd_resource_delete(client, name).await,
+    }
+}
+
+// ── Timestamp Helpers ────────────────────────────────────────────────────────
+
 fn chrono_or_raw(ms: i64) -> String {
     // Format Unix ms as a simple date string without a chrono dep.
     // Divides down to seconds, produces YYYY-MM-DD HH:MM UTC.
     let secs = ms / 1000;
-    // Simple calculation — good enough for a CLI timestamp display.
     let days_since_epoch = secs / 86400;
     let time_of_day = secs % 86400;
     let h = time_of_day / 3600;
     let m = (time_of_day % 3600) / 60;
 
-    // Gregorian calendar calculation from days since Unix epoch.
     let (y, mo, d) = days_to_ymd(days_since_epoch);
     format!("{:04}-{:02}-{:02} {:02}:{:02} UTC", y, mo, d, h, m)
 }
@@ -312,11 +376,7 @@ fn days_to_ymd(mut days: i64) -> (i64, i64, i64) {
     (y, m, d)
 }
 
-async fn cmd_delete(client: &SkillsClient, name: String) -> Result<()> {
-    client.delete(&name).await?;
-    println!("Deleted '{}'", name);
-    Ok(())
-}
+// ── Bidirectional Sync ───────────────────────────────────────────────────────
 
 async fn cmd_sync(client: &SkillsClient, dir: PathBuf) -> Result<()> {
     use sha2::{Digest, Sha256};
@@ -506,17 +566,17 @@ async fn cmd_sync(client: &SkillsClient, dir: PathBuf) -> Result<()> {
                     let dest = agents_dir.join(format!("{}.md", name));
                     std::fs::write(&dest, &result.bytes)
                         .with_context(|| format!("write agent {}", dest.display()))?;
-                    println!("  pulled agent '{}' → {}", name, dest.display());
+                    println!("  pulled agent '{}' -> {}", name, dest.display());
                 }
                 "command" => {
                     let dest = dir.join(format!("{}.md", name));
                     std::fs::write(&dest, &result.bytes)
                         .with_context(|| format!("write command {}", dest.display()))?;
-                    println!("  pulled command '{}' → {}", name, dest.display());
+                    println!("  pulled command '{}' -> {}", name, dest.display());
                 }
                 _ => {
                     let dest = zip_util::unzip_skill(name, &result.bytes, &dir)?;
-                    println!("  pulled skill '{}' → {}", name, dest.display());
+                    println!("  pulled skill '{}' -> {}", name, dest.display());
                 }
             }
             pulled += 1;
@@ -531,7 +591,7 @@ async fn cmd_sync(client: &SkillsClient, dir: PathBuf) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Config loading: ~/.claude/agent-comms.conf → .env → env vars → CLI flags.
+    // Config loading: ~/.claude/agent-comms.conf -> .env -> env vars -> CLI flags.
     let conf_path = home_dir().join(".claude").join("agent-comms.conf");
     let _ = dotenvy::from_path(&conf_path);
     let _ = dotenvy::dotenv();
@@ -550,8 +610,8 @@ async fn main() -> Result<()> {
                 println!("Already up to date (v{}).", current);
             }
             Some(version) => {
-                println!("Updating sync {} -> {}...", current, version);
-                updater::perform_update(&http, &version, "sync").await?;
+                println!("Updating agent-sync {} -> {}...", current, version);
+                updater::perform_update(&http, &version, "agent-sync").await?;
             }
         }
         return Ok(());
@@ -560,12 +620,9 @@ async fn main() -> Result<()> {
     let client = require_client(cli.url, cli.api_key, cli.timeout_ms)?;
 
     match cli.command {
-        Command::Push { skill_dir } => cmd_push(&client, skill_dir).await,
-        Command::PushCmd { file } => cmd_push_command(&client, file).await,
-        Command::PushAgent { file } => cmd_push_agent(&client, file).await,
-        Command::Pull { name, to } => cmd_pull(&client, name, to).await,
-        Command::List => cmd_list(&client).await,
-        Command::Delete { name } => cmd_delete(&client, name).await,
+        Command::Skills { action } => handle_resource(action, &client, "skill").await,
+        Command::Commands { action } => handle_resource(action, &client, "command").await,
+        Command::Agents { action } => handle_resource(action, &client, "agent").await,
         Command::Sync { dir } => cmd_sync(&client, dir).await,
         Command::Update => unreachable!(),
     }

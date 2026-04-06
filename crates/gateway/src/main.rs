@@ -143,7 +143,7 @@ async fn main() -> Result<()> {
             Some(version) => {
                 println!("Updating agent-comms {} -> {}...", current, version);
                 let install_dir = std::path::Path::new("/opt/agentic/bin");
-                for bin_name in &["agent-comms", "gateway", "sync"] {
+                for bin_name in &["agent-comms", "gateway", "agent-sync"] {
                     let path = install_dir.join(bin_name);
                     if path.exists() {
                         match updater::perform_update_at(&client, &version, bin_name, &path).await {

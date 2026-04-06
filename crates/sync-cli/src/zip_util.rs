@@ -61,6 +61,35 @@ pub fn unzip_skill(name: &str, zip_bytes: &[u8], dest_dir: &Path) -> Result<std:
     Ok(out)
 }
 
+/// Wrap a single file into an in-memory zip. Returns (zip_bytes, sha256_hex).
+/// The file is stored at the root of the archive using its original filename.
+pub fn zip_single_file(file_path: &Path) -> Result<(Vec<u8>, String)> {
+    let buf = Vec::new();
+    let cursor = std::io::Cursor::new(buf);
+    let mut zip = ZipWriter::new(cursor);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    let file_name = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("file has no name")?;
+    zip.start_file(file_name, options)
+        .context("zip start file")?;
+    let mut f = std::fs::File::open(file_path).context("open file")?;
+    let mut data = Vec::new();
+    f.read_to_end(&mut data).context("read file")?;
+    zip.write_all(&data).context("write to zip")?;
+
+    let cursor = zip.finish().context("finish zip")?;
+    let bytes = cursor.into_inner();
+
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let checksum = hex::encode(hasher.finalize());
+
+    Ok((bytes, checksum))
+}
+
 /// Compute SHA-256 of a skill directory (same as zip_skill_dir but returns only the checksum).
 pub fn checksum_skill_dir(skill_dir: &Path) -> Result<String> {
     let (_, checksum) = zip_skill_dir(skill_dir)?;

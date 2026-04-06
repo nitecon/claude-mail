@@ -4,14 +4,14 @@
     Install or upgrade agent-comms client tools on Windows.
 .DESCRIPTION
     Downloads the latest agent-comms release from GitHub and installs
-    agent-comms.exe and sync.exe to %USERPROFILE%\.agentic\bin\.
+    agent-comms.exe and agent-sync.exe to %USERPROFILE%\.agentic\bin\.
     Adds the directory to the user's PATH if not already present.
 #>
 
 $ErrorActionPreference = "Stop"
 
 $Repo = "nitecon/agent-comms"
-$Binaries = @("agent-comms.exe", "sync.exe")
+$Binaries = @("agent-comms.exe", "agent-sync.exe")
 $InstallDir = Join-Path $env:USERPROFILE ".agentic\bin"
 
 # --- Helpers ----------------------------------------------------------------
@@ -109,7 +109,7 @@ Write-Host "  Version:     $LatestTag"
 Write-Host ""
 Write-Host "Quick start:"
 Write-Host "  agent-comms init                    # Interactive setup"
-Write-Host "  sync push my-skill .\skill-dir      # Push a skill to gateway"
+Write-Host "  agent-sync skills push .\skill-dir   # Push a skill to gateway"
 Write-Host ""
 Write-Host "Register as MCP server for Claude Code:"
 Write-Host "  claude mcp add agent-comms -- `"$InstallDir\agent-comms.exe`""

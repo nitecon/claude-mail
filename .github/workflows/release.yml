@@ -81,7 +81,7 @@ jobs:
           # Binaries (new names from Cargo.toml)
           cp "target/${{ matrix.target }}/release/agent-comms" "$STAGING/agent-comms"
           cp "target/${{ matrix.target }}/release/gateway" "$STAGING/gateway"
-          cp "target/${{ matrix.target }}/release/sync" "$STAGING/sync"
+          cp "target/${{ matrix.target }}/release/agent-sync" "$STAGING/agent-sync"
 
           # Extras
           cp crates/gateway/gateway.service "$STAGING/"
@@ -100,7 +100,7 @@ jobs:
 
           Copy-Item "target/${{ matrix.target }}/release/agent-comms.exe" "$staging/agent-comms.exe"
           Copy-Item "target/${{ matrix.target }}/release/gateway.exe" "$staging/gateway.exe"
-          Copy-Item "target/${{ matrix.target }}/release/sync.exe" "$staging/sync.exe"
+          Copy-Item "target/${{ matrix.target }}/release/agent-sync.exe" "$staging/agent-sync.exe"
 
           Compress-Archive -Path $staging -DestinationPath "${staging}.zip"
           echo "ASSET=${staging}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append

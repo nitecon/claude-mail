@@ -63,7 +63,7 @@ irm https://raw.githubusercontent.com/nitecon/agent-comms/main/install.ps1 | iex
 This installs three binaries:
 - `agent-comms` — MCP server (per-machine)
 - `gateway` — Gateway service
-- `sync` — Skills management CLI
+- `agent-sync` — Skills management CLI
 
 ### Build from source
 
@@ -76,7 +76,7 @@ cargo build --release
 Binaries:
 - `target/release/gateway`
 - `target/release/agent-comms`
-- `target/release/sync`
+- `target/release/agent-sync`
 
 ---
 
@@ -232,29 +232,29 @@ Use the `agent-comms` MCP server to stay in contact with the user.
 
 ## Sync CLI reference
 
-`sync` manages shared Claude Code skills on the gateway. A skill is any directory containing a `SKILL.md` file.
+`agent-sync` manages shared Claude Code skills on the gateway. A skill is any directory containing a `SKILL.md` file.
 
 ```bash
 # Upload a skill directory to the gateway
-sync push ~/.claude/skills/my-skill
+agent-sync push ~/.claude/skills/my-skill
 
 # Download a skill from the gateway
-sync pull my-skill --to ~/.claude/skills
+agent-sync pull my-skill --to ~/.claude/skills
 
 # List all skills on the gateway
-sync list
+agent-sync list
 
 # Delete a skill from the gateway
-sync delete my-skill
+agent-sync delete my-skill
 
 # Bidirectional sync: push new/changed local, pull new remote
-sync sync --dir ~/.claude/skills
+agent-sync sync --dir ~/.claude/skills
 ```
 
 Configuration uses the same `~/.claude/agent-comms.conf` written by `agent-comms init`, or CLI flags:
 
 ```bash
-sync --url http://your-gateway:7913 --api-key <key> list
+agent-sync --url http://your-gateway:7913 --api-key <key> list
 ```
 
 ---
@@ -295,7 +295,7 @@ Both instances share:
 - The same message history
 - The same read cursor (last `get_messages` call from either machine advances it for both)
 
-Skills on the gateway are also accessible from all machines — `sync sync` keeps every machine's skill set up to date.
+Skills on the gateway are also accessible from all machines — `agent-sync sync` keeps every machine's skill set up to date.
 
 ---
 

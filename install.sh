@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO="nitecon/agent-comms"
 INSTALL_DIR="/opt/agentic/bin"
-BINARIES=("agent-comms" "sync")
+BINARIES=("agent-comms" "agent-sync")
 
 # --- Helpers ----------------------------------------------------------------
 
@@ -104,7 +104,7 @@ echo "  Version:     ${LATEST_TAG}"
 echo ""
 echo "Quick start:"
 echo "  agent-comms init                    # Interactive setup"
-echo "  sync push my-skill ./skill-dir      # Push a skill to gateway"
+echo "  agent-sync skills push ./skill-dir   # Push a skill to gateway"
 echo ""
 echo "Register as MCP server for Claude Code:"
 echo "  claude mcp add agent-comms -- ${INSTALL_DIR}/agent-comms"

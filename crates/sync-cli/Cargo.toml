@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "sync"
+name = "agent-sync"
 path = "src/main.rs"
 
 [dependencies]
