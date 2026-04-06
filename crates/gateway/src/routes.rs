@@ -391,7 +391,7 @@ pub async fn manage_page(State(state): State<AppState>) -> Html<String> {
     Html(format!(
         r##"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>claude-mail — Manage</title>
+<title>agent-comms — Manage</title>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{font-family:system-ui,sans-serif;background:#f7fafc;color:#1a202c;padding:2rem 1rem}}
@@ -440,7 +440,7 @@ tr:hover td{{background:#f7fafc}}
 </style></head>
 <body><div class="wrap">
 <header>
-  <div><h1>claude-mail — Manage</h1><div class="sub">Skills, Commands &amp; Agents</div></div>
+  <div><h1>agent-comms — Manage</h1><div class="sub">Skills, Commands &amp; Agents</div></div>
   <a class="back" href="/">&larr; Dashboard</a>
 </header>
 <div id="msg" class="msg"></div>
