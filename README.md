@@ -112,7 +112,7 @@ DISCORD_CATEGORY_ID=                  # optional -- leave blank for top-level ch
 GATEWAY_API_KEY=choose-a-long-random-secret
 GATEWAY_HOST=0.0.0.0
 GATEWAY_PORT=7913
-DATABASE_PATH=./data/agent-gateway.db
+DATABASE_PATH=/opt/agentic/gateway/agent-gateway.db
 MESSAGE_RETENTION_DAYS=30
 RUST_LOG=info
 ```
@@ -131,7 +131,7 @@ RUST_LOG=info
 You should see:
 
 ```
-INFO gateway: SQLite database opened at ./data/agent-gateway.db
+INFO gateway: SQLite database opened at /opt/agentic/gateway/agent-gateway.db
 INFO gateway: Gateway listening on http://0.0.0.0:7913
 INFO gateway::discord: Discord bot connected as YourBotName#1234
 ```
