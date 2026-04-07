@@ -11,9 +11,10 @@ curl -fsSL https://raw.githubusercontent.com/nitecon/agent-gateway/main/install-
 ## Create the service user and directories
 
 ```bash
-sudo useradd --system --no-create-home --shell /bin/false agent-gateway
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin agentic
 sudo mkdir -p /etc/agent-gateway /var/lib/agent-gateway
-sudo chown -R agent-gateway:agent-gateway /etc/agent-gateway /var/lib/agent-gateway
+sudo chown root:agentic /etc/agent-gateway
+sudo chown agentic:agentic /var/lib/agent-gateway
 ```
 
 ## Configure the environment file
@@ -56,7 +57,7 @@ RUST_LOG=info
 Restrict permissions so only the service user can read it:
 
 ```bash
-sudo chown agent-gateway:agent-gateway /etc/agent-gateway/gateway.env
+sudo chown root:agentic /etc/agent-gateway/gateway.env
 sudo chmod 640 /etc/agent-gateway/gateway.env
 ```
 
@@ -78,9 +79,11 @@ After=network.target
 
 [Service]
 Type=simple
-User=agent-gateway
-Group=agent-gateway
+User=agentic
+Group=agentic
 
+# Secrets and config live in /etc/agent-gateway/gateway.env (not world-readable).
+# Copy crates/gateway/.env.example to /etc/agent-gateway/gateway.env and fill in values.
 EnvironmentFile=/etc/agent-gateway/gateway.env
 
 ExecStartPre=/usr/local/bin/gateway update
@@ -93,13 +96,13 @@ TimeoutStopSec=10
 # Logging goes to the system journal: journalctl -u gateway -f
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=gateway
+SyslogIdentifier=agent-gateway
 
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/agent-gateway
+ReadWritePaths=/var/lib/agent-gateway /opt/agentic/bin
 
 [Install]
 WantedBy=multi-user.target
