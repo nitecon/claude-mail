@@ -5,8 +5,8 @@ REPO="nitecon/agent-gateway"
 INSTALL_DIR="/opt/agentic/bin"
 BINARY_NAME="gateway"
 SYMLINK="/usr/local/bin/gateway"
-SERVICE_USER="agent-gateway"
-SERVICE_GROUP="agent-gateway"
+SVC_USER="agentic"
+SVC_GROUP="agentic"
 CONFIG_DIR="/etc/agent-gateway"
 DATA_DIR="/var/lib/agent-gateway"
 SERVICE_NAME="gateway.service"
@@ -36,6 +36,35 @@ case "$ARCH" in
   aarch64|arm64) ARCH="aarch64" ;;
   *)             error "Unsupported architecture: $ARCH" ;;
 esac
+
+# --- Create agentic system user and group -----------------------------------
+
+if ! getent group "$SVC_GROUP" >/dev/null 2>&1; then
+  groupadd --system "$SVC_GROUP"
+  info "Created system group: ${SVC_GROUP}"
+fi
+
+if ! getent passwd "$SVC_USER" >/dev/null 2>&1; then
+  useradd --system --gid "$SVC_GROUP" --no-create-home --shell /usr/sbin/nologin "$SVC_USER"
+  info "Created system user: ${SVC_USER}"
+fi
+
+# Add all human users (uid >= 1000, excluding nobody) to the agentic group
+while IFS=: read -r username _ uid _; do
+  if [ "$uid" -ge 1000 ] 2>/dev/null && [ "$username" != "nobody" ]; then
+    if ! id -nG "$username" 2>/dev/null | grep -qw "$SVC_GROUP"; then
+      usermod -aG "$SVC_GROUP" "$username"
+      info "Added user ${username} to ${SVC_GROUP} group"
+    fi
+  fi
+done < /etc/passwd
+
+# --- Set /opt/agentic ownership ---------------------------------------------
+
+mkdir -p /opt/agentic/bin
+chown -R "${SVC_USER}:${SVC_GROUP}" /opt/agentic
+chmod -R 775 /opt/agentic
+info "Set /opt/agentic ownership to ${SVC_USER}:${SVC_GROUP}"
 
 # --- Resolve latest version -------------------------------------------------
 
@@ -84,41 +113,33 @@ tar xzf "${TMPDIR}/${ARCHIVE_NAME}" -C "$TMPDIR"
 
 # --- Install binary ---------------------------------------------------------
 
-mkdir -p "$INSTALL_DIR"
-
 BIN_PATH=$(find "$TMPDIR" -name "$BINARY_NAME" -type f ! -name "*.tar.gz" ! -name "*.service" | head -1)
 if [ -z "$BIN_PATH" ]; then
   error "Binary '${BINARY_NAME}' not found in archive."
 fi
 
 mv "$BIN_PATH" "${INSTALL_DIR}/${BINARY_NAME}"
-chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+chown "${SVC_USER}:${SVC_GROUP}" "${INSTALL_DIR}/${BINARY_NAME}"
+chmod 775 "${INSTALL_DIR}/${BINARY_NAME}"
 ln -sf "${INSTALL_DIR}/${BINARY_NAME}" "$SYMLINK"
 info "Installed ${INSTALL_DIR}/${BINARY_NAME} (symlinked to ${SYMLINK})"
-
-# --- Create system user and group -------------------------------------------
-
-if ! getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
-  groupadd --system "$SERVICE_GROUP"
-  info "Created system group: ${SERVICE_GROUP}"
-fi
-
-if ! getent passwd "$SERVICE_USER" >/dev/null 2>&1; then
-  useradd --system --gid "$SERVICE_GROUP" --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
-  info "Created system user: ${SERVICE_USER}"
-fi
 
 # --- Create directories -----------------------------------------------------
 
 mkdir -p "$CONFIG_DIR"
+chown root:"$SVC_GROUP" "$CONFIG_DIR"
 chmod 750 "$CONFIG_DIR"
-chown root:"$SERVICE_GROUP" "$CONFIG_DIR"
 info "Config directory: ${CONFIG_DIR}"
 
 mkdir -p "$DATA_DIR"
-chown "$SERVICE_USER":"$SERVICE_GROUP" "$DATA_DIR"
+chown "${SVC_USER}:${SVC_GROUP}" "$DATA_DIR"
 chmod 750 "$DATA_DIR"
 info "Data directory: ${DATA_DIR}"
+
+# Ensure any existing DB files are owned correctly on upgrades
+if ls "${DATA_DIR}"/*.db* &>/dev/null; then
+  chown "${SVC_USER}:${SVC_GROUP}" "${DATA_DIR}"/*.db*
+fi
 
 # --- Install systemd service ------------------------------------------------
 
@@ -155,8 +176,8 @@ MESSAGE_RETENTION_DAYS=30
 # Default channel plugin
 DEFAULT_CHANNEL=discord
 ENVEOF
+  chown root:"$SVC_GROUP" "${CONFIG_DIR}/gateway.env"
   chmod 640 "${CONFIG_DIR}/gateway.env"
-  chown root:"$SERVICE_GROUP" "${CONFIG_DIR}/gateway.env"
   info "Created template config: ${CONFIG_DIR}/gateway.env"
 else
   info "Existing config preserved: ${CONFIG_DIR}/gateway.env"

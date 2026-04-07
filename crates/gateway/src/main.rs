@@ -143,11 +143,15 @@ async fn main() -> Result<()> {
             Some(version) => {
                 println!("Updating agent-gateway {} -> {}...", current, version);
                 let install_dir = std::path::Path::new("/opt/agentic/bin");
+                let mut any_ok = false;
                 for bin_name in &["gateway"] {
                     let path = install_dir.join(bin_name);
                     if path.exists() {
                         match updater::perform_update_at(&client, &version, bin_name, &path).await {
-                            Ok(()) => println!("  Updated {}", bin_name),
+                            Ok(()) => {
+                                println!("  Updated {}", bin_name);
+                                any_ok = true;
+                            }
                             Err(e) => eprintln!("  Failed to update {}: {}", bin_name, e),
                         }
                     }
@@ -155,9 +159,17 @@ async fn main() -> Result<()> {
                 // Also self-update if not in /opt/agentic/bin
                 let current_exe = std::env::current_exe().unwrap_or_default();
                 if !current_exe.starts_with(install_dir) {
-                    updater::perform_update(&client, &version, "gateway").await?;
+                    match updater::perform_update(&client, &version, "gateway").await {
+                        Ok(()) => any_ok = true,
+                        Err(e) => eprintln!("  Failed to self-update: {e}"),
+                    }
                 }
-                println!("Updated to {}.", version);
+                if any_ok {
+                    println!("Updated to {}.", version);
+                } else {
+                    eprintln!("Update to {} failed for all binaries.", version);
+                    std::process::exit(1);
+                }
             }
         }
         return Ok(());

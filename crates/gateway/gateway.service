@@ -5,8 +5,8 @@ After=network.target
 
 [Service]
 Type=simple
-User=agent-gateway
-Group=agent-gateway
+User=agentic
+Group=agentic
 
 # Secrets and config live in /etc/agent-gateway/gateway.env (not world-readable).
 # Copy crates/gateway/.env.example to /etc/agent-gateway/gateway.env and fill in values.
@@ -28,7 +28,7 @@ SyslogIdentifier=agent-gateway
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/agent-gateway
+ReadWritePaths=/var/lib/agent-gateway /opt/agentic/bin
 
 [Install]
 WantedBy=multi-user.target
