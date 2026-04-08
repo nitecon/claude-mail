@@ -47,6 +47,18 @@ pub trait ChannelPlugin: Send + Sync {
 
     async fn send(&self, room_id: &str, content: &str) -> Result<String>;
 
+    /// Reply to a specific message in the room. Returns a message ID.
+    /// Default implementation falls back to `send()`.
+    async fn reply(
+        &self,
+        room_id: &str,
+        reply_to_external_id: &str,
+        content: &str,
+    ) -> Result<String> {
+        let _ = reply_to_external_id;
+        self.send(room_id, content).await
+    }
+
     async fn fetch_since(
         &self,
         room_id: &str,
@@ -135,7 +147,13 @@ Before returning, call `self.register_room(&room_id, None)` so the plugin immedi
 
 #### `send(room_id, content) -> Result<String>`
 
-Deliver `content` to the room identified by `room_id`. Return a stable, unique message ID that can be used as a backfill cursor by `fetch_since`. The gateway prepends `[AGENT]` to the content before calling this method — do not add it yourself.
+Deliver `content` to the room identified by `room_id`. Return a stable, unique message ID that can be used as a backfill cursor by `fetch_since`. The gateway prepends `[AGENT]` (or `[AGENT:agent_id]`) to the content before calling this method — do not add it yourself.
+
+#### `reply(room_id, reply_to_external_id, content) -> Result<String>`
+
+Reply to a specific message in the room, creating a thread or visual reply chain if the platform supports it. `reply_to_external_id` is the plugin-specific external message ID of the message being replied to.
+
+The default implementation ignores `reply_to_external_id` and falls back to `send()`. Override this if your platform supports native threading (e.g. Discord message references, Slack threads). The Discord plugin implements this by setting a `reference_message` on the outgoing message.
 
 #### `fetch_since(room_id, after_id) -> Result<Vec<InboundMessage>>`
 

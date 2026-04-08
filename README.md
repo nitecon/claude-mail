@@ -154,7 +154,14 @@ All endpoints require `Authorization: Bearer <GATEWAY_API_KEY>`.
 |--------|------|-------------|
 | `POST` | `/v1/projects` | Register a project. Creates the channel if needed. Idempotent. Body: `{"ident": "...", "channel": "discord"}` |
 | `POST` | `/v1/projects/:ident/messages` | Send an agent message. Body: `{"content": "..."}` |
-| `GET` | `/v1/projects/:ident/messages/unread` | Get unread messages and advance the read cursor. |
+| `GET` | `/v1/projects/:ident/messages/unread` | Get unread messages for this agent. |
+| `POST` | `/v1/projects/:ident/messages/:id/confirm` | Confirm (acknowledge) a message for this agent. |
+| `POST` | `/v1/projects/:ident/messages/:id/reply` | Reply to a specific message (threaded). Body: `{"content": "..."}` |
+| `POST` | `/v1/projects/:ident/messages/:id/action` | Post an action notice on a message. Body: `{"message": "..."}` |
+
+#### Multi-agent support
+
+All messaging endpoints accept an optional `X-Agent-Id` header. When provided, each agent gets its own unread queue — messages confirmed by one agent remain unread for others. If omitted, the agent identity defaults to `_default`. Outbound messages are tagged with the agent identity (e.g. `[AGENT:my-agent]` instead of `[AGENT]`).
 
 ### Skills
 
@@ -176,7 +183,7 @@ All endpoints require `Authorization: Bearer <GATEWAY_API_KEY>`.
 Point all client instances at the same gateway with the same project identity. They share:
 - The same communication channel
 - The same message history
-- The same read cursor (last `get_messages` call from either machine advances it for both)
+- Per-agent unread queues (each agent ID tracks its own read state independently)
 
 Skills on the gateway are also accessible from all machines.
 
@@ -219,7 +226,7 @@ Both tools read the gateway connection from `~/.agentic/config.toml`, environmen
 Ensure **Message Content Intent** is enabled in the Discord Developer Portal under your bot's settings. Without it, `message.content` is always empty.
 
 **`get_messages` returns old messages repeatedly**
-The read cursor is shared across all agent instances for a project. If a second agent instance calls `get_messages`, it advances the cursor, so the first instance won't see those messages. This is by design for v1.
+Each agent has its own unread queue keyed by the `X-Agent-Id` header (default `_default`). Confirm messages via `POST /v1/projects/:ident/messages/:id/confirm` to mark them as read for your agent. Different agents can read and confirm independently.
 
 **Gateway can't create channels**
 The bot needs **Manage Channels** permission in your Discord server. Re-invite it using the OAuth2 URL Generator with that permission checked.
