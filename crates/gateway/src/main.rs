@@ -98,6 +98,9 @@ fn spawn_inbound_processor(db: Db, mut rx: mpsc::Receiver<PluginEvent>) {
                     content: message.content,
                     sent_at: db::now_ms(),
                     confirmed_at: None,
+                    parent_message_id: None,
+                    agent_id: None,
+                    message_type: "message".into(),
                 };
                 db::insert_message(&conn, &m)?;
                 db::update_last_msg_id(&conn, &project.ident, &message.id)?;
@@ -329,6 +332,14 @@ async fn main() -> Result<()> {
         .route(
             "/v1/projects/{ident}/messages/{id}/confirm",
             post(routes::confirm_message),
+        )
+        .route(
+            "/v1/projects/{ident}/messages/{id}/reply",
+            post(routes::reply_to_message),
+        )
+        .route(
+            "/v1/projects/{ident}/messages/{id}/action",
+            post(routes::taking_action_on),
         )
         .route("/v1/skills", get(routes::list_skills_handler))
         .route(

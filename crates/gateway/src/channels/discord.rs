@@ -152,6 +152,29 @@ impl ChannelPlugin for DiscordPlugin {
         Ok(msg.id.to_string())
     }
 
+    async fn reply(
+        &self,
+        room_id: &str,
+        reply_to_external_id: &str,
+        content: &str,
+    ) -> Result<String> {
+        let id: u64 = room_id.parse().context("parse Discord channel id")?;
+        let reply_to: u64 = reply_to_external_id
+            .parse()
+            .context("parse reply-to message id")?;
+        let ch = ChannelId::new(id);
+        let msg = ch
+            .send_message(
+                self.http(),
+                CreateMessage::new()
+                    .content(content)
+                    .reference_message((ch, MessageId::new(reply_to))),
+            )
+            .await
+            .context("send Discord reply")?;
+        Ok(msg.id.to_string())
+    }
+
     async fn fetch_since(
         &self,
         room_id: &str,

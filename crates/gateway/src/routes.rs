@@ -35,6 +35,15 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
 
 type Result<T> = std::result::Result<T, AppError>;
 
+/// Extract agent identity from X-Agent-Id header, defaulting to "_default".
+fn extract_agent_id(headers: &HeaderMap) -> String {
+    headers
+        .get("x-agent-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("_default")
+        .to_string()
+}
+
 // ── POST /v1/projects ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -127,6 +136,7 @@ pub struct SendMessageResponse {
 
 pub async fn send_message(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(ident): Path<String>,
     Json(body): Json<SendMessageRequest>,
 ) -> Result<Json<SendMessageResponse>> {
@@ -154,7 +164,12 @@ pub async fn send_message(
         })?
         .clone();
 
-    let formatted = format!("[AGENT] {}", body.content);
+    let agent_id = extract_agent_id(&headers);
+    let formatted = if agent_id == "_default" {
+        format!("[AGENT] {}", body.content)
+    } else {
+        format!("[AGENT:{}] {}", agent_id, body.content)
+    };
     let external_id = plugin.send(&room_id, &formatted).await?;
 
     let msg = Message {
@@ -164,12 +179,18 @@ pub async fn send_message(
         external_message_id: Some(external_id.clone()),
         content: body.content,
         sent_at: now_ms(),
-        confirmed_at: None, // insert_message auto-confirms agent messages
+        confirmed_at: None,
+        parent_message_id: None,
+        agent_id: Some(agent_id.clone()),
+        message_type: "message".into(),
     };
 
     let db = state.db.clone();
+    let ident_clone = ident.clone();
+    let aid = agent_id;
     let row_id = spawn_blocking(move || {
         let conn = db.lock().unwrap();
+        db::upsert_agent(&conn, &ident_clone, &aid)?;
         db::insert_message(&conn, &msg)
     })
     .await??;
@@ -732,6 +753,7 @@ pub struct GetUnreadResponse {
 
 pub async fn get_unread_messages(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(ident): Path<String>,
 ) -> Result<Json<GetUnreadResponse>> {
     {
@@ -744,11 +766,14 @@ pub async fn get_unread_messages(
         }
     }
 
+    let agent_id = extract_agent_id(&headers);
     let db = state.db.clone();
     let ident_clone = ident.clone();
+    let aid = agent_id;
     let messages = spawn_blocking(move || {
         let conn = db.lock().unwrap();
-        db::get_unconfirmed_messages(&conn, &ident_clone)
+        db::upsert_agent(&conn, &ident_clone, &aid)?;
+        db::get_unconfirmed_for_agent(&conn, &ident_clone, &aid)
     })
     .await??;
 
@@ -770,6 +795,7 @@ pub struct ConfirmResponse {
 
 pub async fn confirm_message(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((ident, msg_id)): Path<(String, i64)>,
 ) -> Result<Json<ConfirmResponse>> {
     {
@@ -782,13 +808,185 @@ pub async fn confirm_message(
         }
     }
 
+    let agent_id = extract_agent_id(&headers);
     let db = state.db.clone();
     let ident_clone = ident.clone();
+    let aid = agent_id;
     let confirmed = spawn_blocking(move || {
         let conn = db.lock().unwrap();
-        db::confirm_message(&conn, &ident_clone, msg_id)
+        db::confirm_message_for_agent(&conn, &ident_clone, &aid, msg_id)
     })
     .await??;
 
     Ok(Json(ConfirmResponse { confirmed }))
+}
+
+// ── POST /v1/projects/:ident/messages/:id/reply ─────────────────────────────
+
+#[derive(Deserialize)]
+pub struct ReplyRequest {
+    pub content: String,
+}
+
+#[derive(Serialize)]
+pub struct ReplyResponse {
+    pub message_id: i64,
+    pub external_message_id: String,
+    pub parent_message_id: i64,
+}
+
+pub async fn reply_to_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((ident, parent_id)): Path<(String, i64)>,
+    Json(body): Json<ReplyRequest>,
+) -> Result<Json<ReplyResponse>> {
+    let agent_id = extract_agent_id(&headers);
+
+    let (channel_name, room_id, parent_external_id) = {
+        let conn = state.db.lock().unwrap();
+        let project = db::get_project(&conn, &ident)?.ok_or_else(|| {
+            AppError(StatusCode::NOT_FOUND, format!("project '{}' not found", ident))
+        })?;
+        let parent = db::get_message_by_id(&conn, &ident, parent_id)?.ok_or_else(|| {
+            AppError(StatusCode::NOT_FOUND, format!("message {} not found", parent_id))
+        })?;
+        (project.channel_name, project.room_id, parent.external_message_id)
+    };
+
+    let plugin = state
+        .plugins
+        .get(&channel_name)
+        .ok_or_else(|| {
+            AppError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("plugin '{channel_name}' not loaded"),
+            )
+        })?
+        .clone();
+
+    let formatted = if agent_id == "_default" {
+        format!("[AGENT] {}", body.content)
+    } else {
+        format!("[AGENT:{}] {}", agent_id, body.content)
+    };
+
+    let external_id = match &parent_external_id {
+        Some(ext_id) => plugin.reply(&room_id, ext_id, &formatted).await?,
+        None => plugin.send(&room_id, &formatted).await?,
+    };
+
+    let msg = Message {
+        id: 0,
+        project_ident: ident.clone(),
+        source: "agent".into(),
+        external_message_id: Some(external_id.clone()),
+        content: body.content,
+        sent_at: now_ms(),
+        confirmed_at: None,
+        parent_message_id: Some(parent_id),
+        agent_id: Some(agent_id.clone()),
+        message_type: "reply".into(),
+    };
+
+    let db = state.db.clone();
+    let ident_clone = ident.clone();
+    let aid = agent_id;
+    let row_id = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::upsert_agent(&conn, &ident_clone, &aid)?;
+        db::insert_message(&conn, &msg)
+    })
+    .await??;
+
+    Ok(Json(ReplyResponse {
+        message_id: row_id,
+        external_message_id: external_id,
+        parent_message_id: parent_id,
+    }))
+}
+
+// ── POST /v1/projects/:ident/messages/:id/action ────────────────────────────
+
+#[derive(Deserialize)]
+pub struct ActionRequest {
+    pub message: String,
+}
+
+#[derive(Serialize)]
+pub struct ActionResponse {
+    pub message_id: i64,
+    pub external_message_id: String,
+    pub parent_message_id: i64,
+}
+
+pub async fn taking_action_on(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((ident, parent_id)): Path<(String, i64)>,
+    Json(body): Json<ActionRequest>,
+) -> Result<Json<ActionResponse>> {
+    let agent_id = extract_agent_id(&headers);
+
+    let (channel_name, room_id, parent_external_id) = {
+        let conn = state.db.lock().unwrap();
+        let project = db::get_project(&conn, &ident)?.ok_or_else(|| {
+            AppError(StatusCode::NOT_FOUND, format!("project '{}' not found", ident))
+        })?;
+        let parent = db::get_message_by_id(&conn, &ident, parent_id)?.ok_or_else(|| {
+            AppError(StatusCode::NOT_FOUND, format!("message {} not found", parent_id))
+        })?;
+        (project.channel_name, project.room_id, parent.external_message_id)
+    };
+
+    let plugin = state
+        .plugins
+        .get(&channel_name)
+        .ok_or_else(|| {
+            AppError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("plugin '{channel_name}' not loaded"),
+            )
+        })?
+        .clone();
+
+    let formatted = if agent_id == "_default" {
+        format!("[ACTION] {}", body.message)
+    } else {
+        format!("[ACTION:{}] {}", agent_id, body.message)
+    };
+
+    let external_id = match &parent_external_id {
+        Some(ext_id) => plugin.reply(&room_id, ext_id, &formatted).await?,
+        None => plugin.send(&room_id, &formatted).await?,
+    };
+
+    let msg = Message {
+        id: 0,
+        project_ident: ident.clone(),
+        source: "agent".into(),
+        external_message_id: Some(external_id.clone()),
+        content: body.message,
+        sent_at: now_ms(),
+        confirmed_at: None,
+        parent_message_id: Some(parent_id),
+        agent_id: Some(agent_id.clone()),
+        message_type: "action".into(),
+    };
+
+    let db = state.db.clone();
+    let ident_clone = ident.clone();
+    let aid = agent_id;
+    let row_id = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::upsert_agent(&conn, &ident_clone, &aid)?;
+        db::insert_message(&conn, &msg)
+    })
+    .await??;
+
+    Ok(Json(ActionResponse {
+        message_id: row_id,
+        external_message_id: external_id,
+        parent_message_id: parent_id,
+    }))
 }

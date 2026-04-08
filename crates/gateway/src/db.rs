@@ -28,6 +28,10 @@ pub struct Message {
     pub sent_at: i64,
     /// Timestamp (ms) when the agent confirmed this message, or None if unconfirmed.
     pub confirmed_at: Option<i64>,
+    pub parent_message_id: Option<i64>,
+    pub agent_id: Option<String>,
+    /// "message" | "reply" | "action"
+    pub message_type: String,
 }
 
 pub fn open(path: &str) -> Result<Db> {
@@ -106,6 +110,43 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         [],
     );
     let _ = conn.execute("ALTER TABLE skills ADD COLUMN content TEXT", []);
+
+    // ── Migration: per-agent message buffers ─────────────────────────────────
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS agents (
+            project_ident  TEXT NOT NULL REFERENCES projects(ident),
+            agent_id       TEXT NOT NULL,
+            registered_at  INTEGER NOT NULL,
+            PRIMARY KEY (project_ident, agent_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS agent_confirmations (
+            agent_id       TEXT NOT NULL,
+            project_ident  TEXT NOT NULL,
+            message_id     INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            confirmed_at   INTEGER NOT NULL,
+            PRIMARY KEY (agent_id, project_ident, message_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_agent_conf_project
+            ON agent_confirmations(project_ident, message_id);",
+    )?;
+
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN parent_message_id INTEGER", []);
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN agent_id TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE messages ADD COLUMN message_type TEXT NOT NULL DEFAULT 'message'",
+        [],
+    );
+
+    // Migrate existing confirmed messages to agent_confirmations for "_default" agent.
+    conn.execute(
+        "INSERT OR IGNORE INTO agent_confirmations (agent_id, project_ident, message_id, confirmed_at)
+         SELECT '_default', project_ident, id, confirmed_at
+         FROM messages
+         WHERE confirmed_at IS NOT NULL",
+        [],
+    )?;
 
     Ok(())
 }
@@ -188,50 +229,103 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
 // ── Messages ─────────────────────────────────────────────────────────────────
 
 pub fn insert_message(conn: &Connection, m: &Message) -> Result<i64> {
-    // Agent messages are auto-confirmed at insert time so they never appear in
-    // the unconfirmed queue — the agent already knows what it sent.
     let confirmed_at = if m.source == "agent" {
         Some(now_ms())
     } else {
         None
     };
     conn.execute(
-        "INSERT INTO messages (project_ident, source, external_message_id, content, sent_at, confirmed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO messages (project_ident, source, external_message_id, content, sent_at, confirmed_at, parent_message_id, agent_id, message_type)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             m.project_ident,
             m.source,
             m.external_message_id,
             m.content,
             m.sent_at,
-            confirmed_at
+            confirmed_at,
+            m.parent_message_id,
+            m.agent_id,
+            m.message_type
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    let msg_id = conn.last_insert_rowid();
+
+    // Auto-confirm for the sending agent so it doesn't appear in their unread queue.
+    if m.source == "agent" {
+        if let Some(ref aid) = m.agent_id {
+            conn.execute(
+                "INSERT OR IGNORE INTO agent_confirmations (agent_id, project_ident, message_id, confirmed_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![aid, m.project_ident, msg_id, now_ms()],
+            )?;
+        }
+    }
+
+    Ok(msg_id)
 }
 
-/// Returns all unconfirmed messages for a project (peek — no side effects).
-pub fn get_unconfirmed_messages(conn: &Connection, ident: &str) -> Result<Vec<Message>> {
+/// Lazily register an agent for a project.
+pub fn upsert_agent(conn: &Connection, project_ident: &str, agent_id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO agents (project_ident, agent_id, registered_at)
+         VALUES (?1, ?2, ?3)",
+        params![project_ident, agent_id, now_ms()],
+    )?;
+    Ok(())
+}
+
+/// Get all messages not yet confirmed by a specific agent.
+pub fn get_unconfirmed_for_agent(
+    conn: &Connection,
+    ident: &str,
+    agent_id: &str,
+) -> Result<Vec<Message>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id, project_ident, source, external_message_id, content, sent_at, confirmed_at
-         FROM messages
-         WHERE project_ident = ?1 AND confirmed_at IS NULL
-         ORDER BY id ASC",
+        "SELECT m.id, m.project_ident, m.source, m.external_message_id,
+                m.content, m.sent_at, m.confirmed_at,
+                m.parent_message_id, m.agent_id, m.message_type
+         FROM messages m
+         WHERE m.project_ident = ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM agent_confirmations ac
+               WHERE ac.agent_id = ?2
+                 AND ac.project_ident = ?1
+                 AND ac.message_id = m.id
+           )
+         ORDER BY m.id ASC",
     )?;
     let collected = stmt
-        .query_map(params![ident], row_to_message)?
+        .query_map(params![ident, agent_id], row_to_message)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(collected)
 }
 
-/// Mark a single message as confirmed. Returns true if the message was unconfirmed and is now confirmed.
-pub fn confirm_message(conn: &Connection, project_ident: &str, msg_id: i64) -> Result<bool> {
+/// Confirm a message for a specific agent. Returns true if newly confirmed.
+pub fn confirm_message_for_agent(
+    conn: &Connection,
+    project_ident: &str,
+    agent_id: &str,
+    msg_id: i64,
+) -> Result<bool> {
     let n = conn.execute(
-        "UPDATE messages SET confirmed_at = ?1
-         WHERE id = ?2 AND project_ident = ?3 AND confirmed_at IS NULL",
-        params![now_ms(), msg_id, project_ident],
+        "INSERT OR IGNORE INTO agent_confirmations (agent_id, project_ident, message_id, confirmed_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![agent_id, project_ident, msg_id, now_ms()],
     )?;
     Ok(n > 0)
+}
+
+/// Fetch a single message by ID within a project.
+pub fn get_message_by_id(conn: &Connection, project_ident: &str, msg_id: i64) -> Result<Option<Message>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, project_ident, source, external_message_id, content, sent_at, confirmed_at,
+                parent_message_id, agent_id, message_type
+         FROM messages
+         WHERE id = ?1 AND project_ident = ?2",
+    )?;
+    let mut rows = stmt.query_map(params![msg_id, project_ident], row_to_message)?;
+    Ok(rows.next().transpose()?)
 }
 
 fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
@@ -243,12 +337,16 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         content: row.get(4)?,
         sent_at: row.get(5)?,
         confirmed_at: row.get(6)?,
+        parent_message_id: row.get(7)?,
+        agent_id: row.get(8)?,
+        message_type: row.get::<_, Option<String>>(9)?.unwrap_or_else(|| "message".into()),
     })
 }
 
 // ── Retention ─────────────────────────────────────────────────────────────────
 
 pub fn purge_old_messages(conn: &Connection, cutoff_ms: i64) -> Result<usize> {
+    // agent_confirmations cleaned up via ON DELETE CASCADE on messages(id).
     let n = conn.execute(
         "DELETE FROM messages
          WHERE sent_at < ?1

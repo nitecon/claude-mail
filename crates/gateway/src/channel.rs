@@ -74,6 +74,19 @@ pub trait ChannelPlugin: Send + Sync {
     /// Post a message to the room. Returns an opaque message ID.
     async fn send(&self, room_id: &str, content: &str) -> Result<String>;
 
+    /// Reply to a specific message in the room. Returns an opaque message ID.
+    /// `reply_to_external_id` is the plugin-specific ID of the message being replied to.
+    /// Default: falls back to `send()` for plugins without native threading.
+    async fn reply(
+        &self,
+        room_id: &str,
+        reply_to_external_id: &str,
+        content: &str,
+    ) -> Result<String> {
+        let _ = reply_to_external_id;
+        self.send(room_id, content).await
+    }
+
     /// Fetch messages received in `room_id` after `after_id`.
     ///
     /// Used during backfill (reconnect / startup). Returns messages in
