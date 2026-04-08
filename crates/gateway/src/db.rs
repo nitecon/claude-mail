@@ -132,7 +132,10 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             ON agent_confirmations(project_ident, message_id);",
     )?;
 
-    let _ = conn.execute("ALTER TABLE messages ADD COLUMN parent_message_id INTEGER", []);
+    let _ = conn.execute(
+        "ALTER TABLE messages ADD COLUMN parent_message_id INTEGER",
+        [],
+    );
     let _ = conn.execute("ALTER TABLE messages ADD COLUMN agent_id TEXT", []);
     let _ = conn.execute(
         "ALTER TABLE messages ADD COLUMN message_type TEXT NOT NULL DEFAULT 'message'",
@@ -317,7 +320,11 @@ pub fn confirm_message_for_agent(
 }
 
 /// Fetch a single message by ID within a project.
-pub fn get_message_by_id(conn: &Connection, project_ident: &str, msg_id: i64) -> Result<Option<Message>> {
+pub fn get_message_by_id(
+    conn: &Connection,
+    project_ident: &str,
+    msg_id: i64,
+) -> Result<Option<Message>> {
     let mut stmt = conn.prepare_cached(
         "SELECT id, project_ident, source, external_message_id, content, sent_at, confirmed_at,
                 parent_message_id, agent_id, message_type
@@ -339,7 +346,9 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         confirmed_at: row.get(6)?,
         parent_message_id: row.get(7)?,
         agent_id: row.get(8)?,
-        message_type: row.get::<_, Option<String>>(9)?.unwrap_or_else(|| "message".into()),
+        message_type: row
+            .get::<_, Option<String>>(9)?
+            .unwrap_or_else(|| "message".into()),
     })
 }
 

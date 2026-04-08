@@ -846,12 +846,22 @@ pub async fn reply_to_message(
     let (channel_name, room_id, parent_external_id) = {
         let conn = state.db.lock().unwrap();
         let project = db::get_project(&conn, &ident)?.ok_or_else(|| {
-            AppError(StatusCode::NOT_FOUND, format!("project '{}' not found", ident))
+            AppError(
+                StatusCode::NOT_FOUND,
+                format!("project '{}' not found", ident),
+            )
         })?;
         let parent = db::get_message_by_id(&conn, &ident, parent_id)?.ok_or_else(|| {
-            AppError(StatusCode::NOT_FOUND, format!("message {} not found", parent_id))
+            AppError(
+                StatusCode::NOT_FOUND,
+                format!("message {} not found", parent_id),
+            )
         })?;
-        (project.channel_name, project.room_id, parent.external_message_id)
+        (
+            project.channel_name,
+            project.room_id,
+            parent.external_message_id,
+        )
     };
 
     let plugin = state
@@ -931,12 +941,22 @@ pub async fn taking_action_on(
     let (channel_name, room_id, parent_external_id) = {
         let conn = state.db.lock().unwrap();
         let project = db::get_project(&conn, &ident)?.ok_or_else(|| {
-            AppError(StatusCode::NOT_FOUND, format!("project '{}' not found", ident))
+            AppError(
+                StatusCode::NOT_FOUND,
+                format!("project '{}' not found", ident),
+            )
         })?;
         let parent = db::get_message_by_id(&conn, &ident, parent_id)?.ok_or_else(|| {
-            AppError(StatusCode::NOT_FOUND, format!("message {} not found", parent_id))
+            AppError(
+                StatusCode::NOT_FOUND,
+                format!("message {} not found", parent_id),
+            )
         })?;
-        (project.channel_name, project.room_id, parent.external_message_id)
+        (
+            project.channel_name,
+            project.room_id,
+            parent.external_message_id,
+        )
     };
 
     let plugin = state
