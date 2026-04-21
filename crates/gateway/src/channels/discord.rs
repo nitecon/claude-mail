@@ -2,8 +2,10 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serenity::{
     all::{
-        ChannelId, ChannelType, Context as SerenityCtx, CreateChannel, CreateMessage, EventHandler,
-        GatewayIntents, GetMessages, GuildChannel, GuildId, Message, MessageId, Ready, UserId,
+        ChannelId, ChannelType, Context as SerenityCtx, CreateChannel, CreateEmbed,
+        CreateEmbedAuthor, CreateMessage, EventHandler, GatewayIntents, GetMessages, GuildChannel,
+        GuildId, Message, MessageId, MessageReference, MessageReferenceKind, Ready, Timestamp,
+        UserId,
     },
     Client,
 };
@@ -14,7 +16,47 @@ use std::{
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use crate::channel::{ChannelPlugin, InboundMessage, PluginEvent};
+use crate::channel::{ChannelPlugin, InboundMessage, OutboundMessage, PluginEvent};
+
+// ── Embed limits ──────────────────────────────────────────────────────────────
+
+/// Discord embed title limit (per API docs).
+const EMBED_TITLE_MAX: usize = 256;
+/// Discord embed description limit. We reserve room for the surrounding
+/// triple-backtick fence and an ellipsis.
+const EMBED_BODY_MAX: usize = 4000;
+/// Brand color for agent posts (Discord blurple).
+const EMBED_COLOR: u32 = 0x5865F2;
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
+fn build_embed(msg: &OutboundMessage) -> CreateEmbed {
+    let title = truncate_chars(&msg.subject, EMBED_TITLE_MAX);
+    // Sanitize triple-backticks so user content cannot escape the fence.
+    let safe_body = msg.body.replace("```", "``\u{200B}`");
+    let body = truncate_chars(&safe_body, EMBED_BODY_MAX);
+    let description = format!("```\n{}\n```", body);
+    let author_name = format!("{} · {}", msg.agent_id, msg.hostname);
+
+    let mut embed = CreateEmbed::new()
+        .title(title)
+        .description(description)
+        .author(CreateEmbedAuthor::new(author_name))
+        .color(EMBED_COLOR);
+
+    if let Ok(ts) = Timestamp::from_unix_timestamp(msg.event_at / 1000) {
+        embed = embed.timestamp(ts);
+    }
+    embed
+}
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -173,6 +215,41 @@ impl ChannelPlugin for DiscordPlugin {
             .await
             .context("send Discord reply")?;
         Ok(msg.id.to_string())
+    }
+
+    async fn send_structured(&self, room_id: &str, msg: &OutboundMessage) -> Result<String> {
+        let id: u64 = room_id.parse().context("parse Discord channel id")?;
+        let ch = ChannelId::new(id);
+        let sent = ch
+            .send_message(self.http(), CreateMessage::new().embed(build_embed(msg)))
+            .await
+            .context("send Discord embed")?;
+        Ok(sent.id.to_string())
+    }
+
+    async fn reply_structured(
+        &self,
+        room_id: &str,
+        reply_to_external_id: &str,
+        msg: &OutboundMessage,
+    ) -> Result<String> {
+        let id: u64 = room_id.parse().context("parse Discord channel id")?;
+        let reply_to: u64 = reply_to_external_id
+            .parse()
+            .context("parse reply-to message id")?;
+        let ch = ChannelId::new(id);
+        let reference = MessageReference::new(MessageReferenceKind::Default, ch)
+            .message_id(MessageId::new(reply_to));
+        let sent = ch
+            .send_message(
+                self.http(),
+                CreateMessage::new()
+                    .embed(build_embed(msg))
+                    .reference_message(reference),
+            )
+            .await
+            .context("send Discord embed reply")?;
+        Ok(sent.id.to_string())
     }
 
     async fn fetch_since(

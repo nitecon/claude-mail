@@ -30,4 +30,5 @@ async-trait = "0.1"
 anyhow = "1"
 reqwest = { version = "0.13", features = ["json"] }
 clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 updater = { path = "../updater" }

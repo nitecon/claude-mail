@@ -10,6 +10,7 @@ use tokio::task::spawn_blocking;
 use tracing::error;
 
 use crate::{
+    channel::OutboundMessage,
     db::{self, now_ms, Message, Project},
     projects::sanitize_ident,
     AppState,
@@ -42,6 +43,58 @@ fn extract_agent_id(headers: &HeaderMap) -> String {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("_default")
         .to_string()
+}
+
+/// Maximum length of an auto-derived subject when the agent does not supply one.
+const AUTO_SUBJECT_MAX: usize = 80;
+
+/// Derive a subject from the body when one is not supplied: first non-empty
+/// line, trimmed, capped at `AUTO_SUBJECT_MAX` characters with an ellipsis if
+/// truncated. Falls back to a generic placeholder for empty bodies.
+fn derive_subject(body: &str) -> String {
+    let first_line = body.lines().map(str::trim).find(|l| !l.is_empty());
+    match first_line {
+        None => "(no content)".to_string(),
+        Some(line) => {
+            let count = line.chars().count();
+            if count <= AUTO_SUBJECT_MAX {
+                line.to_string()
+            } else {
+                let mut out: String = line.chars().take(AUTO_SUBJECT_MAX - 1).collect();
+                out.push('…');
+                out
+            }
+        }
+    }
+}
+
+/// Apply default values for any missing structured fields and return a
+/// fully-populated `OutboundMessage`. The body argument is the resolved
+/// payload (caller picks between the structured `body` field and any
+/// route-specific alias such as `content` or `message`).
+fn build_outbound(
+    agent_id: &str,
+    body: String,
+    subject: Option<String>,
+    hostname: Option<String>,
+    event_at: Option<i64>,
+) -> OutboundMessage {
+    let subject = subject
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| derive_subject(&body));
+    let hostname = hostname
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| agent_id.to_string());
+    let event_at = event_at.unwrap_or_else(now_ms);
+    OutboundMessage {
+        agent_id: agent_id.to_string(),
+        hostname,
+        subject,
+        body,
+        event_at,
+    }
 }
 
 // ── Theme (GET/POST /theme) ──────────────────────────────────────────────────
@@ -168,7 +221,13 @@ pub async fn register_project(
 
 #[derive(Deserialize)]
 pub struct SendMessageRequest {
-    pub content: String,
+    /// Back-compat alias for `body`. If both are set, `body` wins.
+    pub content: Option<String>,
+    pub body: Option<String>,
+    pub subject: Option<String>,
+    pub hostname: Option<String>,
+    /// Event time in epoch milliseconds. Defaults to now() when omitted.
+    pub event_at: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -181,7 +240,7 @@ pub async fn send_message(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(ident): Path<String>,
-    Json(body): Json<SendMessageRequest>,
+    Json(req): Json<SendMessageRequest>,
 ) -> Result<Json<SendMessageResponse>> {
     let (channel_name, room_id) = {
         let conn = state.db.lock().unwrap();
@@ -208,24 +267,36 @@ pub async fn send_message(
         .clone();
 
     let agent_id = extract_agent_id(&headers);
-    let formatted = if agent_id == "_default" {
-        format!("[AGENT] {}", body.content)
-    } else {
-        format!("[AGENT:{}] {}", agent_id, body.content)
-    };
-    let external_id = plugin.send(&room_id, &formatted).await?;
+    let body_text = req.body.or(req.content).unwrap_or_default();
+    if body_text.trim().is_empty() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "request must include non-empty 'body' (or 'content')".into(),
+        ));
+    }
+    let outbound = build_outbound(
+        &agent_id,
+        body_text,
+        req.subject,
+        req.hostname,
+        req.event_at,
+    );
+    let external_id = plugin.send_structured(&room_id, &outbound).await?;
 
     let msg = Message {
         id: 0,
         project_ident: ident.clone(),
         source: "agent".into(),
         external_message_id: Some(external_id.clone()),
-        content: body.content,
+        content: outbound.body.clone(),
         sent_at: now_ms(),
         confirmed_at: None,
         parent_message_id: None,
         agent_id: Some(agent_id.clone()),
         message_type: "message".into(),
+        subject: Some(outbound.subject.clone()),
+        hostname: Some(outbound.hostname.clone()),
+        event_at: Some(outbound.event_at),
     };
 
     let db = state.db.clone();
@@ -929,7 +1000,12 @@ pub async fn confirm_message(
 
 #[derive(Deserialize)]
 pub struct ReplyRequest {
-    pub content: String,
+    /// Back-compat alias for `body`. If both are set, `body` wins.
+    pub content: Option<String>,
+    pub body: Option<String>,
+    pub subject: Option<String>,
+    pub hostname: Option<String>,
+    pub event_at: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -943,7 +1019,7 @@ pub async fn reply_to_message(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((ident, parent_id)): Path<(String, i64)>,
-    Json(body): Json<ReplyRequest>,
+    Json(req): Json<ReplyRequest>,
 ) -> Result<Json<ReplyResponse>> {
     let agent_id = extract_agent_id(&headers);
 
@@ -979,15 +1055,24 @@ pub async fn reply_to_message(
         })?
         .clone();
 
-    let formatted = if agent_id == "_default" {
-        format!("[AGENT] {}", body.content)
-    } else {
-        format!("[AGENT:{}] {}", agent_id, body.content)
-    };
+    let body_text = req.body.or(req.content).unwrap_or_default();
+    if body_text.trim().is_empty() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "request must include non-empty 'body' (or 'content')".into(),
+        ));
+    }
+    let outbound = build_outbound(
+        &agent_id,
+        body_text,
+        req.subject,
+        req.hostname,
+        req.event_at,
+    );
 
     let external_id = match &parent_external_id {
-        Some(ext_id) => plugin.reply(&room_id, ext_id, &formatted).await?,
-        None => plugin.send(&room_id, &formatted).await?,
+        Some(ext_id) => plugin.reply_structured(&room_id, ext_id, &outbound).await?,
+        None => plugin.send_structured(&room_id, &outbound).await?,
     };
 
     let msg = Message {
@@ -995,12 +1080,15 @@ pub async fn reply_to_message(
         project_ident: ident.clone(),
         source: "agent".into(),
         external_message_id: Some(external_id.clone()),
-        content: body.content,
+        content: outbound.body.clone(),
         sent_at: now_ms(),
         confirmed_at: None,
         parent_message_id: Some(parent_id),
         agent_id: Some(agent_id.clone()),
         message_type: "reply".into(),
+        subject: Some(outbound.subject.clone()),
+        hostname: Some(outbound.hostname.clone()),
+        event_at: Some(outbound.event_at),
     };
 
     let db = state.db.clone();
@@ -1024,7 +1112,12 @@ pub async fn reply_to_message(
 
 #[derive(Deserialize)]
 pub struct ActionRequest {
-    pub message: String,
+    /// Back-compat alias for `body`. If both are set, `body` wins.
+    pub message: Option<String>,
+    pub body: Option<String>,
+    pub subject: Option<String>,
+    pub hostname: Option<String>,
+    pub event_at: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -1038,7 +1131,7 @@ pub async fn taking_action_on(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((ident, parent_id)): Path<(String, i64)>,
-    Json(body): Json<ActionRequest>,
+    Json(req): Json<ActionRequest>,
 ) -> Result<Json<ActionResponse>> {
     let agent_id = extract_agent_id(&headers);
 
@@ -1074,15 +1167,24 @@ pub async fn taking_action_on(
         })?
         .clone();
 
-    let formatted = if agent_id == "_default" {
-        format!("[ACTION] {}", body.message)
-    } else {
-        format!("[ACTION:{}] {}", agent_id, body.message)
-    };
+    let body_text = req.body.or(req.message).unwrap_or_default();
+    if body_text.trim().is_empty() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "request must include non-empty 'body' (or 'message')".into(),
+        ));
+    }
+    // Action posts get an `[ACTION]` subject prefix when the agent doesn't
+    // supply one, so they remain visually distinct from regular replies.
+    let subject = req.subject.or_else(|| {
+        let derived = derive_subject(&body_text);
+        Some(format!("[ACTION] {}", derived))
+    });
+    let outbound = build_outbound(&agent_id, body_text, subject, req.hostname, req.event_at);
 
     let external_id = match &parent_external_id {
-        Some(ext_id) => plugin.reply(&room_id, ext_id, &formatted).await?,
-        None => plugin.send(&room_id, &formatted).await?,
+        Some(ext_id) => plugin.reply_structured(&room_id, ext_id, &outbound).await?,
+        None => plugin.send_structured(&room_id, &outbound).await?,
     };
 
     let msg = Message {
@@ -1090,12 +1192,15 @@ pub async fn taking_action_on(
         project_ident: ident.clone(),
         source: "agent".into(),
         external_message_id: Some(external_id.clone()),
-        content: body.message,
+        content: outbound.body.clone(),
         sent_at: now_ms(),
         confirmed_at: None,
         parent_message_id: Some(parent_id),
         agent_id: Some(agent_id.clone()),
         message_type: "action".into(),
+        subject: Some(outbound.subject.clone()),
+        hostname: Some(outbound.hostname.clone()),
+        event_at: Some(outbound.event_at),
     };
 
     let db = state.db.clone();

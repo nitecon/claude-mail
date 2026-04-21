@@ -32,6 +32,13 @@ pub struct Message {
     pub agent_id: Option<String>,
     /// "message" | "reply" | "action"
     pub message_type: String,
+    /// Short headline supplied by the agent (or auto-derived from the body).
+    pub subject: Option<String>,
+    /// Origin host the agent claims to be running on (defaults to agent_id).
+    pub hostname: Option<String>,
+    /// Event time (epoch ms) supplied by the agent — distinct from sent_at,
+    /// which is the gateway-receive time.
+    pub event_at: Option<i64>,
 }
 
 pub fn open(path: &str) -> Result<Db> {
@@ -141,6 +148,11 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         "ALTER TABLE messages ADD COLUMN message_type TEXT NOT NULL DEFAULT 'message'",
         [],
     );
+
+    // ── Migration: structured-message fields (subject/hostname/event_at) ─────
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN subject TEXT", []);
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN hostname TEXT", []);
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN event_at INTEGER", []);
 
     // Migrate existing confirmed messages to agent_confirmations for "_default" agent.
     conn.execute(
@@ -274,8 +286,8 @@ pub fn insert_message(conn: &Connection, m: &Message) -> Result<i64> {
         None
     };
     conn.execute(
-        "INSERT INTO messages (project_ident, source, external_message_id, content, sent_at, confirmed_at, parent_message_id, agent_id, message_type)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO messages (project_ident, source, external_message_id, content, sent_at, confirmed_at, parent_message_id, agent_id, message_type, subject, hostname, event_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             m.project_ident,
             m.source,
@@ -285,7 +297,10 @@ pub fn insert_message(conn: &Connection, m: &Message) -> Result<i64> {
             confirmed_at,
             m.parent_message_id,
             m.agent_id,
-            m.message_type
+            m.message_type,
+            m.subject,
+            m.hostname,
+            m.event_at,
         ],
     )?;
     let msg_id = conn.last_insert_rowid();
@@ -323,7 +338,8 @@ pub fn get_unconfirmed_for_agent(
     let mut stmt = conn.prepare_cached(
         "SELECT m.id, m.project_ident, m.source, m.external_message_id,
                 m.content, m.sent_at, m.confirmed_at,
-                m.parent_message_id, m.agent_id, m.message_type
+                m.parent_message_id, m.agent_id, m.message_type,
+                m.subject, m.hostname, m.event_at
          FROM messages m
          WHERE m.project_ident = ?1
            AND NOT EXISTS (
@@ -363,7 +379,7 @@ pub fn get_message_by_id(
 ) -> Result<Option<Message>> {
     let mut stmt = conn.prepare_cached(
         "SELECT id, project_ident, source, external_message_id, content, sent_at, confirmed_at,
-                parent_message_id, agent_id, message_type
+                parent_message_id, agent_id, message_type, subject, hostname, event_at
          FROM messages
          WHERE id = ?1 AND project_ident = ?2",
     )?;
@@ -385,6 +401,9 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         message_type: row
             .get::<_, Option<String>>(9)?
             .unwrap_or_else(|| "message".into()),
+        subject: row.get(10)?,
+        hostname: row.get(11)?,
+        event_at: row.get(12)?,
     })
 }
 

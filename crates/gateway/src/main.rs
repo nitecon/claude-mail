@@ -101,6 +101,9 @@ fn spawn_inbound_processor(db: Db, mut rx: mpsc::Receiver<PluginEvent>) {
                     parent_message_id: None,
                     agent_id: None,
                     message_type: "message".into(),
+                    subject: None,
+                    hostname: None,
+                    event_at: None,
                 };
                 db::insert_message(&conn, &m)?;
                 db::update_last_msg_id(&conn, &project.ident, &message.id)?;
