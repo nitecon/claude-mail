@@ -59,6 +59,24 @@ pub trait ChannelPlugin: Send + Sync {
         self.send(room_id, content).await
     }
 
+    /// Post a structured outbound message. The default impl renders the
+    /// `OutboundMessage` to markdown and forwards to `send()`. Override to
+    /// emit native rich primitives (Discord embeds, Slack blocks, MIME).
+    async fn send_structured(&self, room_id: &str, msg: &OutboundMessage) -> Result<String> {
+        self.send(room_id, &msg.render_markdown()).await
+    }
+
+    /// Structured reply variant. Default impl renders to markdown and
+    /// forwards to `reply()`.
+    async fn reply_structured(
+        &self,
+        room_id: &str,
+        reply_to_external_id: &str,
+        msg: &OutboundMessage,
+    ) -> Result<String> {
+        self.reply(room_id, reply_to_external_id, &msg.render_markdown()).await
+    }
+
     async fn fetch_since(
         &self,
         room_id: &str,
@@ -75,6 +93,17 @@ pub struct InboundMessage {
     pub id: String,       // opaque, plugin-specific message ID (used as backfill cursor)
     pub content: String,
     pub sender: String,   // human-readable: username, email address, etc.
+}
+
+/// A structured outbound message handed to a plugin's `send_structured` /
+/// `reply_structured`. Plugins with rich rendering map these fields onto
+/// native primitives; others fall through to `render_markdown()` + `send()`.
+pub struct OutboundMessage {
+    pub agent_id: String,
+    pub hostname: String,
+    pub subject: String,
+    pub body: String,
+    pub event_at: i64,    // event time in epoch ms (distinct from gateway-receive time)
 }
 
 /// The event your plugin pushes into the shared channel.
@@ -95,7 +124,7 @@ The gateway calls methods in this order:
 1. register_room(room_id, last_msg_id)  ← repeated for every existing project at startup
 2. start(tx)                            ← called once; plugin begins receiving messages
 3. ensure_room(project_ident)           ← called per new project registration
-   send(room_id, content)              ← called per outbound agent message
+   send_structured(room_id, msg)       ← called per outbound agent message (default impl falls back to send)
    fetch_since(room_id, after_id)      ← called during backfill
 ```
 
@@ -147,13 +176,27 @@ Before returning, call `self.register_room(&room_id, None)` so the plugin immedi
 
 #### `send(room_id, content) -> Result<String>`
 
-Deliver `content` to the room identified by `room_id`. Return a stable, unique message ID that can be used as a backfill cursor by `fetch_since`. The gateway prepends `[AGENT]` (or `[AGENT:agent_id]`) to the content before calling this method — do not add it yourself.
+Deliver `content` to the room identified by `room_id`. Return a stable, unique message ID that can be used as a backfill cursor by `fetch_since`. This is the low-level text primitive — most outbound traffic flows through `send_structured`, which renders an `OutboundMessage` and falls back to `send()` for plugins without rich rendering. Do not add any agent prefix yourself; attribution is carried by the structured envelope.
 
 #### `reply(room_id, reply_to_external_id, content) -> Result<String>`
 
 Reply to a specific message in the room, creating a thread or visual reply chain if the platform supports it. `reply_to_external_id` is the plugin-specific external message ID of the message being replied to.
 
 The default implementation ignores `reply_to_external_id` and falls back to `send()`. Override this if your platform supports native threading (e.g. Discord message references, Slack threads). The Discord plugin implements this by setting a `reference_message` on the outgoing message.
+
+#### `send_structured(room_id, msg) -> Result<String>` *(default provided)*
+
+Deliver an `OutboundMessage` (subject, agent/hostname byline, body, event timestamp) to the room. Override this when your platform has rich primitives that map naturally onto the envelope:
+
+- **Discord** renders an embed: `subject` becomes the title, `agent_id · hostname` becomes the embed author, `body` is wrapped in a fenced code block as the description, and `event_at` becomes the embed timestamp.
+- **Slack** would build Block Kit sections.
+- **Email / MIME** would map `subject` to the `Subject` header and `body` to the message body.
+
+The default implementation calls `OutboundMessage::render_markdown()` (bold subject + italic byline + fenced body) and forwards to `send()`. Triple-backticks in the body are sanitized by `render_markdown` so user content cannot break out of the fence — preserve that behavior in your own renderer.
+
+#### `reply_structured(room_id, reply_to_external_id, msg) -> Result<String>` *(default provided)*
+
+Structured analogue of `reply`. Default impl renders the envelope to markdown and forwards to `reply` (which itself falls back to `send` on plugins without native threading). Override when your platform supports both rich rendering AND threading.
 
 #### `fetch_since(room_id, after_id) -> Result<Vec<InboundMessage>>`
 
@@ -412,8 +455,9 @@ The quickest path to a working integration:
    curl -s -X POST http://localhost:3000/v1/projects/test-project/messages \
      -H "Authorization: Bearer $GATEWAY_API_KEY" \
      -H "Content-Type: application/json" \
-     -d '{"content": "hello from agent"}'
+     -d '{"subject": "smoke test", "body": "hello from agent"}'
    ```
+   (The legacy field name `content` is still accepted as an alias for `body`.)
    Verify it appears in the service (inbox, channel, etc.).
 
 4. Reply as a user in the service, then poll:

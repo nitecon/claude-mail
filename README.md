@@ -21,7 +21,7 @@ You (the user)
 
 1. A client calls `POST /v1/projects` with the project's git remote URL or directory name.
 2. The gateway ensures a channel exists for that project (creates it if not).
-3. The client calls `POST /v1/projects/:ident/messages` -- the message appears in the channel prefixed with `[AGENT]`.
+3. The client calls `POST /v1/projects/:ident/messages` -- the message appears in the channel as a rich embed (Discord) or a formatted markdown block (other plugins), with the agent ID and hostname in the byline and the body in a fenced code block.
 4. You reply in the channel.
 5. The client calls `GET /v1/projects/:ident/messages/unread` -- it receives everything since its last check.
 
@@ -153,15 +153,35 @@ All endpoints require `Authorization: Bearer <GATEWAY_API_KEY>`.
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/v1/projects` | Register a project. Creates the channel if needed. Idempotent. Body: `{"ident": "...", "channel": "discord"}` |
-| `POST` | `/v1/projects/:ident/messages` | Send an agent message. Body: `{"content": "..."}` |
+| `POST` | `/v1/projects/:ident/messages` | Send an agent message. Body: message envelope (see below). |
 | `GET` | `/v1/projects/:ident/messages/unread` | Get unread messages for this agent. |
 | `POST` | `/v1/projects/:ident/messages/:id/confirm` | Confirm (acknowledge) a message for this agent. |
-| `POST` | `/v1/projects/:ident/messages/:id/reply` | Reply to a specific message (threaded). Body: `{"content": "..."}` |
-| `POST` | `/v1/projects/:ident/messages/:id/action` | Post an action notice on a message. Body: `{"message": "..."}` |
+| `POST` | `/v1/projects/:ident/messages/:id/reply` | Reply to a specific message (threaded). Body: message envelope (see below). |
+| `POST` | `/v1/projects/:ident/messages/:id/action` | Post an action notice on a message. Body: message envelope (see below). |
+
+#### Message envelope
+
+The three sending endpoints (`messages`, `messages/:id/reply`, `messages/:id/action`) accept the same JSON envelope:
+
+```json
+{
+  "body": "the message text (required)",
+  "subject": "optional headline; auto-derived from the first line of body when omitted",
+  "hostname": "optional origin host; defaults to the agent ID",
+  "event_at": 1714000000000
+}
+```
+
+- `body` is required. An empty or whitespace-only body returns `400 Bad Request`.
+- `subject` is rendered as the embed title (Discord) or bold heading (markdown fallback). On `/action`, an unsupplied subject is auto-prefixed with `[ACTION]` so action posts stay visually distinct.
+- `hostname` is shown in the byline alongside the agent ID. Defaults to the agent ID when omitted.
+- `event_at` is the agent-claimed event time in epoch milliseconds. Distinct from the gateway-receive time stored in `sent_at`. Defaults to `now()`.
+
+For backward compatibility the legacy field names `content` (on `/messages` and `/reply`) and `message` (on `/action`) are still accepted as aliases for `body`. If both are supplied, `body` wins.
 
 #### Multi-agent support
 
-All messaging endpoints accept an optional `X-Agent-Id` header. When provided, each agent gets its own unread queue — messages confirmed by one agent remain unread for others. If omitted, the agent identity defaults to `_default`. Outbound messages are tagged with the agent identity (e.g. `[AGENT:my-agent]` instead of `[AGENT]`).
+All messaging endpoints accept an optional `X-Agent-Id` header. When provided, each agent gets its own unread queue — messages confirmed by one agent remain unread for others. If omitted, the agent identity defaults to `_default`. The agent identity (and the supplied or defaulted hostname) is shown in the byline of each outbound message — as the embed author on Discord, and as an italic `agent · hostname · timestamp` line on markdown-fallback channels.
 
 ### Skills
 
