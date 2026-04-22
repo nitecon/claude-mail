@@ -557,6 +557,101 @@ pub async fn upload_skill_multipart(
     }))
 }
 
+// ── POST /v1/skills/:name (JSON upsert for command/agent) ────────────────────
+
+/// Request body for the JSON upsert endpoint.
+///
+/// `kind` must be `"command"` or `"agent"` — zip-backed skills cannot be
+/// upserted via this endpoint and must use the existing `PUT` (raw body) or
+/// `POST .../multipart` variants, which accept binary data.
+///
+/// `content` is the markdown body and must be non-empty after trimming.
+#[derive(Deserialize)]
+pub struct JsonSkillRequest {
+    pub kind: String,
+    pub content: String,
+}
+
+/// Create-or-update a text-kind skill (`command` or `agent`) via JSON.
+///
+/// ndesign's `data-nd-action` on a `<form>` serializes named inputs into a
+/// JSON body (not multipart). This endpoint is the JSON-native create/edit
+/// path used by the Commands and Agents control-panel pages. Zip skills are
+/// not supported here — they are managed exclusively from the agent-tools
+/// CLI via the raw-body `PUT` endpoint.
+///
+/// Validation:
+/// * `name` — must be non-empty (400).
+/// * `kind` — must be exactly `"command"` or `"agent"` (400 on anything else,
+///   including `"skill"`).
+/// * `content` — must be non-empty after `trim()` (400).
+///
+/// On success the same `SkillUploadResponse` shape as the raw-body PUT is
+/// returned so clients can treat the two endpoints uniformly.
+pub async fn upsert_skill_json(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<JsonSkillRequest>,
+) -> Result<Json<SkillUploadResponse>> {
+    use sha2::{Digest, Sha256};
+
+    if name.trim().is_empty() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "'name' must be non-empty".into(),
+        ));
+    }
+
+    let kind = match req.kind.as_str() {
+        "command" => "command".to_string(),
+        "agent" => "agent".to_string(),
+        other => {
+            return Err(AppError(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "invalid 'kind': '{other}' (must be 'command' or 'agent'; \
+                     zip skills use PUT /v1/skills/:name)"
+                ),
+            ))
+        }
+    };
+
+    if req.content.trim().is_empty() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "'content' must be non-empty".into(),
+        ));
+    }
+
+    let size = req.content.len() as i64;
+    let mut hasher = Sha256::new();
+    hasher.update(req.content.as_bytes());
+    let checksum = hex::encode(hasher.finalize());
+
+    let record = db::SkillRecord {
+        name: name.clone(),
+        kind: kind.clone(),
+        zip_data: vec![],
+        content: Some(req.content),
+        size,
+        checksum: checksum.clone(),
+        uploaded_at: db::now_ms(),
+    };
+    let db = state.db.clone();
+    spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::upsert_skill(&conn, &record)
+    })
+    .await??;
+
+    Ok(Json(SkillUploadResponse {
+        name,
+        kind,
+        size,
+        checksum,
+    }))
+}
+
 #[derive(Deserialize)]
 pub struct ListSkillsQuery {
     /// Optional filter — when set, restrict the response to a single kind.
@@ -686,10 +781,24 @@ pub async fn get_skill_content(
     }
 }
 
-// ── GET /manage ──────────────────────────────────────────────────────────────
+// ── GET /skills, /commands, /agents (control-panel list pages) ──────────────
 
-pub async fn manage_page(State(state): State<AppState>) -> Result<Html<String>> {
-    let api_key = he(&state.api_key);
+/// Render one of the three admin list pages: skills, commands, or agents.
+///
+/// `kind` must be `"skill"`, `"command"`, or `"agent"` and drives the API
+/// URLs, page labels, whether to show the create/edit affordances, and the
+/// row action (Download for zip skills, Edit modal for text kinds).
+///
+/// This is the shared body for `skills_page`, `commands_page`, and
+/// `agents_page`; each public handler is a thin wrapper that passes its kind
+/// through. See the per-kind table in the control-panel docs for the exact
+/// label mapping.
+async fn render_kind_page(state: &AppState, kind: &str) -> Result<Html<String>> {
+    debug_assert!(
+        kind == "skill" || kind == "command" || kind == "agent",
+        "render_kind_page called with unsupported kind '{kind}'"
+    );
+
     let db = state.db.clone();
     let theme = spawn_blocking(move || {
         let conn = db.lock().unwrap();
@@ -697,234 +806,162 @@ pub async fn manage_page(State(state): State<AppState>) -> Result<Html<String>> 
     })
     .await??;
 
-    Ok(Html(format!(
-        r##"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>agent-gateway — Manage</title>
-{ndesign_head}
-</head>
-<body>
-<header class="nd-flex nd-flex-between nd-p-md">
-  <div>
-    <h1>agent-gateway — Manage</h1>
-    <div class="nd-text-muted nd-text-sm">Skills, Commands &amp; Agents</div>
+    let (singular, plural, active, page_title) = match kind {
+        "skill" => ("Skill", "Skills", "skills", "Skills"),
+        "command" => ("Command", "Commands", "commands", "Commands"),
+        "agent" => ("Agent", "Agents", "agents", "Agents"),
+        // Defensive default — debug_assert above catches unexpected kinds in
+        // debug builds; in release we fall through to the skills shape.
+        _ => ("Skill", "Skills", "skills", "Skills"),
+    };
+
+    let is_text_kind = kind == "command" || kind == "agent";
+
+    // Create button row — only for text kinds that can be authored in the UI.
+    let create_row = if is_text_kind {
+        format!(
+            r##"  <div class="nd-flex nd-gap-md nd-mb-md">
+    <button class="nd-btn-primary nd-btn-sm" data-nd-modal="#create-modal">
+      + New {singular}
+    </button>
   </div>
-  <div class="nd-flex nd-gap-sm">
-    <a class="nd-btn-secondary" href="/">Dashboard</a>
-    {theme_toggle}
-  </div>
-</header>
-<main class="nd-p-lg">
-  <nav class="nd-tabs nd-mb-md" role="tablist" id="tabs">
-    <button role="tab" aria-selected="true"  data-tab="command" class="nd-active">Commands</button>
-    <button role="tab" aria-selected="false" data-tab="agent">Agents</button>
-    <button role="tab" aria-selected="false" data-tab="skill">Skills</button>
-  </nav>
+"##,
+        )
+    } else {
+        String::new()
+    };
 
-  <section class="nd-card">
-    <div class="nd-card-header nd-flex nd-flex-between">
-      <strong id="section-title">Commands</strong>
-      <button class="nd-btn-primary nd-btn-sm" id="btn-toggle-create">+ New</button>
+    // Row action cell: Edit modal (text kinds) or a Download link (skills).
+    // NOTE: `data-nd-context` on the Edit button is a spec-risk placeholder —
+    // see the FIXME below near the edit modal.
+    let row_action = if is_text_kind {
+        r##"<!-- FIXME: confirm data-nd-context is the correct attribute for
+                    row-to-modal context propagation; if the spec names it
+                    differently, the edit modal will open with {{name}}
+                    unresolved and we'll need ndesign support. -->
+                <button class="nd-btn-secondary nd-btn-sm"
+                      data-nd-modal="#edit-modal"
+                      data-nd-context>Edit</button>"##
+    } else {
+        r##"<a class="nd-btn-secondary nd-btn-sm"
+                 href="/v1/skills/{{name}}">Download</a>"##
+    };
+
+    // Create/Edit modals — only rendered for text kinds (no file upload in UI).
+    let modals = if is_text_kind {
+        format!(
+            r##"
+<dialog id="create-modal" class="nd-modal">
+  <form data-nd-action="POST /v1/skills/{{{{name}}}}"
+        data-nd-success="close-modal,refresh:#list-body,reset">
+    <h3>New {singular}</h3>
+    <div class="nd-form-group">
+      <label for="create-name">Name</label>
+      <input id="create-name" name="name" required>
     </div>
-
-    <div id="create-form" class="nd-card-body" hidden>
-      <div class="nd-form-group">
-        <label for="create-name">Name</label>
-        <input type="text" id="create-name" placeholder="my-item">
-      </div>
-      <div class="nd-form-group" id="create-text-row">
-        <label for="create-content">Content</label>
-        <textarea id="create-content" rows="8" placeholder="Markdown content..."></textarea>
-      </div>
-      <div class="nd-form-group" id="create-file-row" hidden>
-        <label for="create-file">Zip file</label>
-        <input type="file" id="create-file" accept=".zip">
-      </div>
-      <div class="nd-flex nd-gap-sm">
-        <button class="nd-btn-primary" id="btn-create">Create</button>
-        <button class="nd-btn-ghost" id="btn-cancel-create">Cancel</button>
-      </div>
+    <div class="nd-form-group">
+      <label for="create-content">Content</label>
+      <textarea id="create-content" name="content" rows="12" required></textarea>
     </div>
+    <input type="hidden" name="kind" value="{kind}">
+    <menu>
+      <button type="button" data-nd-dismiss class="nd-btn-ghost">Cancel</button>
+      <button type="submit" class="nd-btn-primary">Create</button>
+    </menu>
+  </form>
+</dialog>
 
+<dialog id="edit-modal" class="nd-modal">
+  <form data-nd-action="POST /v1/skills/{{{{name}}}}"
+        data-nd-success="close-modal,refresh:#list-body">
+    <h3>Edit {{{{name}}}}</h3>
+    <div class="nd-form-group">
+      <label for="edit-content">Content</label>
+      <!-- FIXME: confirm data-nd-bind-to-value binding works on textarea; if not, pre-fill is missing and we'll need ndesign support -->
+      <textarea id="edit-content" name="content" rows="12"
+                data-nd-bind="/v1/skills/{{{{name}}}}/content"
+                data-nd-value="content" required></textarea>
+    </div>
+    <input type="hidden" name="kind" value="{kind}">
+    <menu>
+      <button type="button" data-nd-dismiss class="nd-btn-ghost">Cancel</button>
+      <button type="submit" class="nd-btn-primary">Save</button>
+    </menu>
+  </form>
+</dialog>
+"##,
+        )
+    } else {
+        String::new()
+    };
+
+    // NOTE: `data-nd-context` on the Edit button (interpolated above) is a
+    // spec-risk placeholder attribute meaning "when this modal opens, bind
+    // its form inputs to the clicked row's data so `{{name}}` resolves to
+    // that row". If ndesign's row-to-modal context propagation uses a
+    // different attribute name, the edit modal will open without the name
+    // resolved and we'll need to update this once the spec is confirmed.
+    let content = format!(
+        r##"{create_row}  <section class="nd-card">
+    <div class="nd-card-header"><strong>{plural}</strong></div>
     <div class="nd-card-body nd-p-0">
       <table class="nd-table nd-table-hover">
-        <thead><tr><th>Name</th><th>Size</th><th>Updated</th><th style="width:160px">Actions</th></tr></thead>
-        <tbody id="list-body"><tr><td colspan="4" class="nd-text-muted" style="text-align:center">Loading…</td></tr></tbody>
+        <thead>
+          <tr><th>Name</th><th>Size</th><th>Updated</th><th>Actions</th></tr>
+        </thead>
+        <tbody id="list-body"
+               data-nd-bind="/v1/skills?kind={kind}"
+               data-nd-template="row-template">
+          <template id="row-template">
+            <tr>
+              <td>{{{{name}}}}</td>
+              <td class="nd-text-muted">{{{{size}}}}</td>
+              <td class="nd-text-muted">{{{{uploaded_at}}}}</td>
+              <td>
+                {row_action}
+                <button class="nd-btn-danger nd-btn-sm"
+                        data-nd-action="DELETE /v1/skills/{{{{name}}}}"
+                        data-nd-confirm="Delete {{{{name}}}}?"
+                        data-nd-success="refresh:#list-body">Delete</button>
+              </td>
+            </tr>
+          </template>
+          <template data-nd-empty>
+            <tr><td colspan="4" class="nd-text-muted">No {plural_lower} yet.</td></tr>
+          </template>
+        </tbody>
       </table>
     </div>
-
-    <div id="editor" class="nd-card-body" hidden>
-      <div class="nd-flex nd-flex-between nd-mb-sm">
-        <strong id="editor-title">Editing: —</strong>
-        <button class="nd-btn-ghost nd-btn-sm" id="btn-close-editor">Close</button>
-      </div>
-      <textarea id="editor-content" rows="16"></textarea>
-      <div class="nd-flex nd-flex-between nd-mt-sm">
-        <span class="nd-text-muted nd-text-sm" id="editor-hint"></span>
-        <button class="nd-btn-primary" id="btn-save">Save</button>
-      </div>
-    </div>
   </section>
-</main>
+{modals}"##,
+        plural_lower = plural.to_lowercase(),
+    );
 
-{ndesign_scripts}
-<script>
-  // Manage-page glue. Uses NDesign.toast for feedback; no custom styles.
-  (() => {{
-    const K = {api_key_json};
-    const H = {{ 'Authorization': 'Bearer ' + K }};
-    let tab = 'command', editName = null;
+    let full_title = format!("agent-gateway — {page_title}");
+    let html = format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
+        head = control_panel_head(&full_title, &theme),
+        open = control_panel_open(page_title, active),
+        content = content,
+        close = control_panel_close(&state.api_key),
+    );
+    Ok(Html(html))
+}
 
-    const $ = (id) => document.getElementById(id);
-    const toast = (m, type) => window.NDesign && NDesign.toast
-      ? NDesign.toast(m, type || 'info')
-      : console.log(`[${{type||'info'}}] ${{m}}`);
+/// `GET /skills` — read-only list of zip-backed skills. Upload/edit flows
+/// live in the agent-tools CLI; the UI here only supports download + delete.
+pub async fn skills_page(State(state): State<AppState>) -> Result<Html<String>> {
+    render_kind_page(&state, "skill").await
+}
 
-    const fmtDate = (ms) => {{
-      const d = new Date(ms);
-      const p = (n) => String(n).padStart(2, '0');
-      return `${{d.getUTCFullYear()}}-${{p(d.getUTCMonth()+1)}}-${{p(d.getUTCDate())}} ${{p(d.getUTCHours())}}:${{p(d.getUTCMinutes())}}`;
-    }};
-    const fmtSize = (b) => b < 1024 ? `${{b}} B` : b < 1048576 ? `${{(b/1024).toFixed(1)}} KB` : `${{(b/1048576).toFixed(1)}} MB`;
-    const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
+/// `GET /commands` — list + create/edit/delete for markdown command skills.
+pub async fn commands_page(State(state): State<AppState>) -> Result<Html<String>> {
+    render_kind_page(&state, "command").await
+}
 
-    function setTab(t) {{
-      tab = t;
-      document.querySelectorAll('#tabs [role=tab]').forEach((el) => {{
-        const active = el.dataset.tab === t;
-        el.classList.toggle('nd-active', active);
-        el.setAttribute('aria-selected', active ? 'true' : 'false');
-      }});
-      $('section-title').textContent = t === 'command' ? 'Commands' : t === 'agent' ? 'Agents' : 'Skills';
-      $('create-text-row').hidden = t === 'skill';
-      $('create-file-row').hidden = t !== 'skill';
-      closeEditor();
-      hideCreate();
-      loadList();
-    }}
-
-    async function loadList() {{
-      const resp = await fetch('/v1/skills', {{ headers: H }});
-      if (!resp.ok) {{ toast('Failed to load list', 'error'); return; }}
-      const items = (await resp.json()).filter((s) => s.kind === tab);
-      const tbody = $('list-body');
-      if (!items.length) {{
-        tbody.innerHTML = `<tr><td colspan="4" class="nd-text-muted" style="text-align:center">No ${{tab}}s yet</td></tr>`;
-        return;
-      }}
-      tbody.innerHTML = items.map((s) => `<tr>
-        <td>${{esc(s.name)}}</td>
-        <td class="nd-text-muted">${{fmtSize(s.size)}}</td>
-        <td class="nd-text-muted">${{fmtDate(s.uploaded_at)}}</td>
-        <td>
-          ${{tab !== 'skill'
-            ? `<button class="nd-btn-secondary nd-btn-sm" data-act="edit" data-name="${{esc(s.name)}}">Edit</button>`
-            : `<a class="nd-btn-secondary nd-btn-sm" href="/v1/skills/${{encodeURIComponent(s.name)}}" target="_blank">Download</a>`}}
-          <button class="nd-btn-danger nd-btn-sm" data-act="delete" data-name="${{esc(s.name)}}">Delete</button>
-        </td>
-      </tr>`).join('');
-    }}
-
-    async function doEdit(name) {{
-      editName = name;
-      const resp = await fetch('/v1/skills/' + encodeURIComponent(name) + '/content', {{ headers: H }});
-      if (!resp.ok) {{ toast('Failed to load content', 'error'); return; }}
-      const data = await resp.json();
-      if (data.content === null) {{ toast('Binary skill — download to edit', 'warning'); return; }}
-      $('editor-title').textContent = 'Editing: ' + name;
-      $('editor-content').value = data.content;
-      $('editor-hint').textContent = data.kind;
-      $('editor').hidden = false;
-    }}
-
-    function closeEditor() {{
-      editName = null;
-      $('editor').hidden = true;
-    }}
-
-    async function doSave() {{
-      if (!editName) return;
-      const content = $('editor-content').value;
-      const resp = await fetch('/v1/skills/' + encodeURIComponent(editName), {{
-        method: 'PUT',
-        headers: {{ ...H, 'Content-Type': 'text/markdown', 'X-Kind': tab }},
-        body: content,
-      }});
-      if (resp.ok) {{ toast('Saved ' + editName, 'success'); loadList(); }}
-      else {{ const e = await resp.json().catch(() => ({{}})); toast(e.error || 'Save failed', 'error'); }}
-    }}
-
-    async function doDelete(name) {{
-      if (!confirm('Delete "' + name + '"?')) return;
-      const resp = await fetch('/v1/skills/' + encodeURIComponent(name), {{ method: 'DELETE', headers: H }});
-      if (resp.ok || resp.status === 204) {{ toast('Deleted ' + name, 'success'); closeEditor(); loadList(); }}
-      else {{ toast('Delete failed', 'error'); }}
-    }}
-
-    function toggleCreate() {{
-      const el = $('create-form');
-      el.hidden = !el.hidden;
-      if (el.hidden) {{ $('create-name').value = ''; $('create-content').value = ''; }}
-    }}
-    function hideCreate() {{ $('create-form').hidden = true; }}
-
-    async function doCreate() {{
-      const name = $('create-name').value.trim();
-      if (!name) {{ toast('Name is required', 'error'); return; }}
-      let resp;
-      if (tab === 'skill') {{
-        const file = $('create-file').files[0];
-        if (!file) {{ toast('Select a zip file', 'error'); return; }}
-        const buf = await file.arrayBuffer();
-        resp = await fetch('/v1/skills/' + encodeURIComponent(name), {{
-          method: 'PUT',
-          headers: {{ ...H, 'Content-Type': 'application/zip', 'X-Kind': 'skill' }},
-          body: buf,
-        }});
-      }} else {{
-        const content = $('create-content').value;
-        if (!content.trim()) {{ toast('Content is required', 'error'); return; }}
-        resp = await fetch('/v1/skills/' + encodeURIComponent(name), {{
-          method: 'PUT',
-          headers: {{ ...H, 'Content-Type': 'text/markdown', 'X-Kind': tab }},
-          body: content,
-        }});
-      }}
-      if (resp.ok) {{ toast('Created ' + (tab === 'skill' ? 'skill ' : tab + ' ') + name, 'success'); hideCreate(); loadList(); }}
-      else {{ const e = await resp.json().catch(() => ({{}})); toast(e.error || 'Create failed', 'error'); }}
-    }}
-
-    // Wire up event delegation.
-    document.getElementById('tabs').addEventListener('click', (e) => {{
-      const btn = e.target.closest('[role=tab]');
-      if (btn) setTab(btn.dataset.tab);
-    }});
-    $('list-body').addEventListener('click', (e) => {{
-      const btn = e.target.closest('button[data-act]');
-      if (!btn) return;
-      const name = btn.dataset.name;
-      if (btn.dataset.act === 'edit') doEdit(name);
-      else if (btn.dataset.act === 'delete') doDelete(name);
-    }});
-    $('btn-toggle-create').addEventListener('click', toggleCreate);
-    $('btn-cancel-create').addEventListener('click', toggleCreate);
-    $('btn-create').addEventListener('click', doCreate);
-    $('btn-close-editor').addEventListener('click', closeEditor);
-    $('btn-save').addEventListener('click', doSave);
-
-    loadList();
-  }})();
-</script>
-</body>
-</html>"##,
-        ndesign_head = ndesign_head(&theme),
-        ndesign_scripts = ndesign_scripts(),
-        theme_toggle = theme_toggle_button(),
-        api_key_json = serde_json::to_string(&api_key).unwrap_or_else(|_| "\"\"".into()),
-    )))
+/// `GET /agents` — list + create/edit/delete for markdown agent skills.
+pub async fn agents_page(State(state): State<AppState>) -> Result<Html<String>> {
+    render_kind_page(&state, "agent").await
 }
 
 // ── GET / (dashboard) ─────────────────────────────────────────────────────────
@@ -1887,40 +1924,12 @@ pub async fn task_detail_page(
     Ok(Html(html))
 }
 
-// ── ndesign partials (shared by dashboard + manage) ──────────────────────────
+// ── ndesign partials (shared by control-panel pages) ─────────────────────────
 
+/// CDN base for the ndesign runtime and theme stylesheets. Shared by
+/// `control_panel_head` / `control_panel_close` and every page that uses
+/// them. Kept as a constant so the version is bumped in one place.
 const NDESIGN_BASE: &str = "https://storage.googleapis.com/ndesign-cdn/ndesign/latest";
-
-fn ndesign_head(theme: &str) -> String {
-    let theme = if theme == "light" { "light" } else { "dark" };
-    format!(
-        r#"<link rel="stylesheet" href="{base}/ndesign.min.css">
-<link rel="stylesheet" class="theme" data-theme="{theme}" href="{base}/themes/{theme}.min.css">
-<meta name="nd-theme" content="light" data-href="{base}/themes/light.min.css">
-<meta name="nd-theme" content="dark" data-href="{base}/themes/dark.min.css">"#,
-        base = NDESIGN_BASE,
-        theme = theme,
-    )
-}
-
-fn ndesign_scripts() -> String {
-    format!(
-        r##"<script src="{base}/ndesign.min.js"></script>
-<script>
-  // Persist theme changes to the server so they survive reloads.
-  document.addEventListener('nd:theme-change', (e) => {{
-    const theme = e.detail && e.detail.theme;
-    if (!theme) return;
-    fetch('/theme', {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{theme}})
-    }}).catch(() => {{}});
-  }});
-</script>"##,
-        base = NDESIGN_BASE,
-    )
-}
 
 fn theme_toggle_button() -> &'static str {
     r#"<button class="nd-btn-secondary" data-nd-theme-toggle title="Toggle theme">Theme</button>"#
@@ -1958,13 +1967,13 @@ fn control_panel_head(title: &str, theme: &str) -> String {
 /// Open the control-panel body up to the start of `<main class="app-content">`.
 ///
 /// Emits `<body class="app-page">`, the app layout wrapper, the sidebar (brand
-/// plus the Main section with Dashboard / Tasks / Manage links), and the
-/// header (hamburger toggle, page title, theme toggle).
+/// plus the Main section with Dashboard, Tasks, Skills, Commands, Agents
+/// links), and the header (hamburger toggle, page title, theme toggle).
 ///
 /// * `page_title` — rendered inside the header's `<h1>`.
 /// * `active` — which sidebar link receives `class="nd-active"`. Accepts
-///   `"dashboard"`, `"tasks"`, or `"manage"`. Any other value leaves all links
-///   inactive.
+///   `"dashboard"`, `"tasks"`, `"skills"`, `"commands"`, or `"agents"`. Any
+///   other value leaves all links inactive.
 fn control_panel_open(page_title: &str, active: &str) -> String {
     let cls = |key: &str| -> &'static str {
         if key == active {
@@ -1982,7 +1991,9 @@ fn control_panel_open(page_title: &str, active: &str) -> String {
     <ul class="nd-nav-menu">
       <li><a href="/"{dashboard}>Dashboard</a></li>
       <li><a href="/tasks"{tasks}>Tasks</a></li>
-      <li><a href="/manage"{manage}>Manage</a></li>
+      <li><a href="/skills"{skills}>Skills</a></li>
+      <li><a href="/commands"{commands}>Commands</a></li>
+      <li><a href="/agents"{agents}>Agents</a></li>
     </ul>
   </nav>
   <div class="app-body">
@@ -1998,7 +2009,9 @@ fn control_panel_open(page_title: &str, active: &str) -> String {
     <main class="app-content">"#,
         dashboard = cls("dashboard"),
         tasks = cls("tasks"),
-        manage = cls("manage"),
+        skills = cls("skills"),
+        commands = cls("commands"),
+        agents = cls("agents"),
         title = he(page_title),
         theme_toggle = theme_toggle_button(),
     )
@@ -2006,8 +2019,18 @@ fn control_panel_open(page_title: &str, active: &str) -> String {
 
 /// Close the control-panel body: close `<main>`, `<div class="app-body">`,
 /// and `<div class="app-layout">`, then emit the ndesign runtime script and
-/// the `NDesign.configure` bearer-auth setup, then close `<body>` and
-/// `<html>`.
+/// an inline config block that (a) wires bearer-auth for XHR and (b)
+/// persists `nd:theme-change` events back to the server.
+///
+/// The theme-change listener was historically emitted by `ndesign_scripts`
+/// for the old `/manage` page. When the dashboard was refactored onto this
+/// shared shell (commit `538d374`), the listener was dropped and theme
+/// toggles stopped surviving reloads. Re-registering it here fixes that
+/// regression for every page built on the control-panel shell.
+///
+/// Output is deliberately limited to two `<script>` tags (the ndesign
+/// runtime + this inline config block) to keep the per-page script budget
+/// predictable.
 ///
 /// The bearer token is JSON-escaped via `serde_json::to_string` so it is safe
 /// to interpolate inside the inline script literal.
@@ -2018,7 +2041,18 @@ fn control_panel_close(api_key: &str) -> String {
   </div>
 </div>
 <script src="{base}/ndesign.min.js"></script>
-<script>NDesign.configure({{ headers: {{ 'Authorization': 'Bearer ' + {api_key_json} }} }});</script>
+<script>
+NDesign.configure({{ headers: {{ 'Authorization': 'Bearer ' + {api_key_json} }} }});
+document.addEventListener('nd:theme-change', (e) => {{
+  const theme = e.detail && e.detail.theme;
+  if (!theme) return;
+  fetch('/theme', {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify({{ theme }})
+  }}).catch(() => {{}});
+}});
+</script>
 </body>
 </html>"#,
         base = NDESIGN_BASE,

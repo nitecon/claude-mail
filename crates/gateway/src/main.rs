@@ -351,6 +351,7 @@ async fn main() -> Result<()> {
         .route(
             "/v1/skills/{name}",
             put(routes::upload_skill)
+                .post(routes::upsert_skill_json)
                 .get(routes::download_skill)
                 .delete(routes::delete_skill_handler),
         )
@@ -379,16 +380,20 @@ async fn main() -> Result<()> {
         )
         .layer(middleware::from_fn_with_state(state.clone(), bearer_auth));
 
-    // Dashboard and manage page are public (local admin pages, no auth required).
+    // Dashboard and admin list pages are public (local admin pages, no auth
+    // required). The three /skills, /commands, /agents pages replace the
+    // old /manage tab hub.
     let app = Router::new()
         .route("/", get(routes::dashboard))
-        .route("/manage", get(routes::manage_page))
         .route("/tasks", get(routes::tasks_picker))
         .route("/projects/{ident}/tasks", get(routes::tasks_board))
         .route(
             "/projects/{ident}/tasks/{id}",
             get(routes::task_detail_page),
         )
+        .route("/skills", get(routes::skills_page))
+        .route("/commands", get(routes::commands_page))
+        .route("/agents", get(routes::agents_page))
         .route("/theme", get(routes::get_theme).post(routes::set_theme))
         .merge(api)
         .with_state(state);
