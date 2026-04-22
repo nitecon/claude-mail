@@ -410,13 +410,180 @@ pub async fn upload_skill(
     }))
 }
 
+/// Multipart variant of the skill-upload endpoint. Accepts a form with:
+///   - `kind` (text): `"skill" | "command" | "agent"` — required
+///   - `content` (text): markdown body — required when kind is `command|agent`
+///   - `file` (binary): zip bytes — required when kind is `skill`
+///
+/// Designed for ndesign's `data-nd-action` form serializer, which posts
+/// `multipart/form-data` when any field is a file. Persists into the same
+/// `skills` table as the raw-body PUT variant.
+pub async fn upload_skill_multipart(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    mut multipart: axum::extract::Multipart,
+) -> Result<Json<SkillUploadResponse>> {
+    use sha2::{Digest, Sha256};
+
+    let mut kind_field: Option<String> = None;
+    let mut content_field: Option<String> = None;
+    let mut file_bytes: Option<Vec<u8>> = None;
+
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        AppError(
+            StatusCode::BAD_REQUEST,
+            format!("failed to parse multipart body: {e}"),
+        )
+    })? {
+        let field_name = field.name().unwrap_or("").to_string();
+        match field_name.as_str() {
+            "kind" => {
+                let text = field.text().await.map_err(|e| {
+                    AppError(
+                        StatusCode::BAD_REQUEST,
+                        format!("failed to read 'kind' field: {e}"),
+                    )
+                })?;
+                kind_field = Some(text.trim().to_lowercase());
+            }
+            "content" => {
+                let text = field.text().await.map_err(|e| {
+                    AppError(
+                        StatusCode::BAD_REQUEST,
+                        format!("failed to read 'content' field: {e}"),
+                    )
+                })?;
+                content_field = Some(text);
+            }
+            "file" => {
+                let bytes = field.bytes().await.map_err(|e| {
+                    AppError(
+                        StatusCode::BAD_REQUEST,
+                        format!("failed to read 'file' field: {e}"),
+                    )
+                })?;
+                file_bytes = Some(bytes.to_vec());
+            }
+            _ => {
+                // Silently ignore unknown fields — ndesign's serializer may
+                // add incidental metadata fields that are not part of the
+                // upload contract.
+            }
+        }
+    }
+
+    let kind = match kind_field.as_deref() {
+        Some("skill") => "skill".to_string(),
+        Some("command") => "command".to_string(),
+        Some("agent") => "agent".to_string(),
+        Some(other) => {
+            return Err(AppError(
+                StatusCode::BAD_REQUEST,
+                format!("invalid 'kind': '{other}' (must be skill|command|agent)"),
+            ))
+        }
+        None => {
+            return Err(AppError(
+                StatusCode::BAD_REQUEST,
+                "'kind' field is required".into(),
+            ))
+        }
+    };
+
+    let (zip_data, content, size) = match kind.as_str() {
+        "skill" => {
+            let bytes = file_bytes.ok_or_else(|| {
+                AppError(
+                    StatusCode::BAD_REQUEST,
+                    "'file' field is required when kind is 'skill'".into(),
+                )
+            })?;
+            if bytes.is_empty() {
+                return Err(AppError(
+                    StatusCode::BAD_REQUEST,
+                    "'file' must be non-empty".into(),
+                ));
+            }
+            let size = bytes.len() as i64;
+            (bytes, None, size)
+        }
+        _ => {
+            // command | agent
+            let text = content_field.ok_or_else(|| {
+                AppError(
+                    StatusCode::BAD_REQUEST,
+                    format!("'content' field is required when kind is '{kind}'"),
+                )
+            })?;
+            if text.trim().is_empty() {
+                return Err(AppError(
+                    StatusCode::BAD_REQUEST,
+                    "'content' must be non-empty".into(),
+                ));
+            }
+            let size = text.len() as i64;
+            (vec![], Some(text), size)
+        }
+    };
+
+    let mut hasher = Sha256::new();
+    match &content {
+        Some(text) => hasher.update(text.as_bytes()),
+        None => hasher.update(&zip_data),
+    }
+    let checksum = hex::encode(hasher.finalize());
+
+    let record = db::SkillRecord {
+        name: name.clone(),
+        kind: kind.clone(),
+        zip_data,
+        content,
+        size,
+        checksum: checksum.clone(),
+        uploaded_at: db::now_ms(),
+    };
+    let db = state.db.clone();
+    spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::upsert_skill(&conn, &record)
+    })
+    .await??;
+
+    Ok(Json(SkillUploadResponse {
+        name,
+        kind,
+        size,
+        checksum,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct ListSkillsQuery {
+    /// Optional filter — when set, restrict the response to a single kind.
+    pub kind: Option<String>,
+}
+
 pub async fn list_skills_handler(
     State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ListSkillsQuery>,
 ) -> Result<Json<Vec<db::SkillMeta>>> {
+    let kind = match q.kind.as_deref() {
+        None | Some("") => None,
+        Some(k) => {
+            if k != "skill" && k != "command" && k != "agent" {
+                return Err(AppError(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid kind '{k}': must be skill|command|agent"),
+                ));
+            }
+            Some(k.to_string())
+        }
+    };
+
     let db = state.db.clone();
     let skills = spawn_blocking(move || {
         let conn = db.lock().unwrap();
-        db::list_skills(&conn)
+        db::list_skills(&conn, kind.as_deref())
     })
     .await??;
     Ok(Json(skills))
@@ -926,30 +1093,30 @@ pub struct AddCommentRequest {
     pub author: Option<String>,
 }
 
+/// Flat detail shape: all `Task` fields at the top level (via `#[serde(flatten)]`)
+/// plus a sibling `comments` array. Designed so that ndesign's `data-nd-bind`
+/// can render the detail view without unwrapping an envelope.
 #[derive(Serialize)]
-pub struct ListTasksResponse {
-    pub tasks: Vec<db::TaskSummary>,
-}
-
-#[derive(Serialize)]
-pub struct TaskResponse {
-    pub task: db::Task,
-}
-
-#[derive(Serialize)]
-pub struct TaskDetailResponse {
+pub struct TaskWithComments {
+    #[serde(flatten)]
     pub task: db::Task,
     pub comments: Vec<db::TaskComment>,
 }
 
 #[derive(Serialize)]
-pub struct CommentResponse {
-    pub comment: db::TaskComment,
-}
-
-#[derive(Serialize)]
 pub struct DeleteResponse {
     pub deleted: bool,
+}
+
+#[derive(Deserialize)]
+pub struct ReorderTasksQuery {
+    /// Target column (`todo` | `in_progress` | `done`). Required.
+    pub status: String,
+}
+
+#[derive(Deserialize)]
+pub struct ReorderTasksRequest {
+    pub order: Vec<String>,
 }
 
 /// Parse a JSON nullable-string update field.
@@ -1009,7 +1176,7 @@ pub async fn list_tasks_handler(
     State(state): State<AppState>,
     Path(ident): Path<String>,
     Query(q): Query<ListTasksQuery>,
-) -> Result<Json<ListTasksResponse>> {
+) -> Result<Json<Vec<db::TaskSummary>>> {
     // Verify project exists (consistent with other handlers).
     {
         let conn = state.db.lock().unwrap();
@@ -1051,7 +1218,7 @@ pub async fn list_tasks_handler(
     })
     .await??;
 
-    Ok(Json(ListTasksResponse { tasks }))
+    Ok(Json(tasks))
 }
 
 pub async fn create_task_handler(
@@ -1059,7 +1226,7 @@ pub async fn create_task_handler(
     headers: HeaderMap,
     Path(ident): Path<String>,
     Json(req): Json<CreateTaskRequest>,
-) -> Result<Json<TaskResponse>> {
+) -> Result<Json<db::Task>> {
     // Verify project exists.
     {
         let conn = state.db.lock().unwrap();
@@ -1102,13 +1269,13 @@ pub async fn create_task_handler(
     })
     .await??;
 
-    Ok(Json(TaskResponse { task }))
+    Ok(Json(task))
 }
 
 pub async fn get_task_handler(
     State(state): State<AppState>,
     Path((ident, task_id)): Path<(String, String)>,
-) -> Result<Json<TaskDetailResponse>> {
+) -> Result<Json<TaskWithComments>> {
     let db = state.db.clone();
     let ident_for_reclaim = ident.clone();
     let ident_for_fetch = ident.clone();
@@ -1121,7 +1288,7 @@ pub async fn get_task_handler(
     .await??;
 
     match detail {
-        Some(d) => Ok(Json(TaskDetailResponse {
+        Some(d) => Ok(Json(TaskWithComments {
             task: d.task,
             comments: d.comments,
         })),
@@ -1137,7 +1304,7 @@ pub async fn update_task_handler(
     headers: HeaderMap,
     Path((ident, task_id)): Path<(String, String)>,
     Json(req): Json<UpdateTaskRequest>,
-) -> Result<Json<TaskResponse>> {
+) -> Result<Json<db::Task>> {
     // Validate & decode the nullable-string fields up-front so we can return
     // 400 on a client-side shape mistake rather than bubbling a 500.
     let owner_opt = decode_nullable_string("owner_agent_id", req.owner_agent_id)?;
@@ -1185,7 +1352,7 @@ pub async fn update_task_handler(
     .await??;
 
     match task {
-        Some(t) => Ok(Json(TaskResponse { task: t })),
+        Some(t) => Ok(Json(t)),
         None => Err(AppError(
             StatusCode::NOT_FOUND,
             format!("task not found in project '{}'", ident),
@@ -1198,7 +1365,7 @@ pub async fn add_comment_handler(
     headers: HeaderMap,
     Path((ident, task_id)): Path<(String, String)>,
     Json(req): Json<AddCommentRequest>,
-) -> Result<Json<CommentResponse>> {
+) -> Result<Json<db::TaskComment>> {
     let content = req.content;
     if content.trim().is_empty() {
         return Err(AppError(
@@ -1252,7 +1419,7 @@ pub async fn add_comment_handler(
     })
     .await??;
 
-    Ok(Json(CommentResponse { comment }))
+    Ok(Json(comment))
 }
 
 pub async fn delete_task_handler(
@@ -1268,6 +1435,59 @@ pub async fn delete_task_handler(
     })
     .await??;
     Ok(Json(DeleteResponse { deleted }))
+}
+
+/// Apply a client-driven reorder within a single status column.
+///
+/// Designed to receive `data-nd-sortable` POSTs: the body is
+/// `{"order": ["id1", "id2", ...]}` and `?status=` selects the column the
+/// order applies to. Returns the fresh list for that column so callers can
+/// re-render without a follow-up GET.
+pub async fn reorder_tasks_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(ident): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<ReorderTasksQuery>,
+    Json(req): Json<ReorderTasksRequest>,
+) -> Result<Json<Vec<db::TaskSummary>>> {
+    // Verify project exists (consistent with other project-scoped handlers).
+    {
+        let conn = state.db.lock().unwrap();
+        if db::get_project(&conn, &ident)?.is_none() {
+            return Err(AppError(
+                StatusCode::NOT_FOUND,
+                format!("project '{}' not found", ident),
+            ));
+        }
+    }
+
+    let status = q.status.clone();
+    if status != "todo" && status != "in_progress" && status != "done" {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            format!("invalid status '{status}': must be todo|in_progress|done"),
+        ));
+    }
+
+    let actor = actor_agent_id(&headers);
+    let db = state.db.clone();
+    let ident_clone = ident;
+    let status_clone = status.clone();
+    let order = req.order;
+
+    let tasks = spawn_blocking(move || -> anyhow::Result<Vec<db::TaskSummary>> {
+        let conn = db.lock().unwrap();
+        db::reorder_tasks_in_column(&conn, &ident_clone, &status_clone, &order, actor.as_deref())?;
+        db::list_tasks(
+            &conn,
+            &ident_clone,
+            std::slice::from_ref(&status_clone),
+            false,
+        )
+    })
+    .await??;
+
+    Ok(Json(tasks))
 }
 
 // ── ndesign partials (shared by dashboard + manage) ──────────────────────────

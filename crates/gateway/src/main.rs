@@ -351,10 +351,18 @@ async fn main() -> Result<()> {
                 .get(routes::download_skill)
                 .delete(routes::delete_skill_handler),
         )
+        .route(
+            "/v1/skills/{name}/multipart",
+            post(routes::upload_skill_multipart),
+        )
         .route("/v1/skills/{name}/content", get(routes::get_skill_content))
         .route(
             "/v1/projects/{ident}/tasks",
             get(routes::list_tasks_handler).post(routes::create_task_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/tasks/reorder",
+            post(routes::reorder_tasks_handler),
         )
         .route(
             "/v1/projects/{ident}/tasks/{id}",

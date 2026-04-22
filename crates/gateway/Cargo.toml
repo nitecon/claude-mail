@@ -14,7 +14,7 @@ discord = ["dep:serenity"]
 # future: email = ["dep:lettre", "dep:async-imap"]
 
 [dependencies]
-axum = { version = "0.8", features = ["json", "http1"] }
+axum = { version = "0.8", features = ["json", "http1", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 serenity = { version = "0.12", optional = true, default-features = false, features = ["client", "gateway", "model", "rustls_backend"] }
 rusqlite = { version = "0.39", features = ["bundled"] }

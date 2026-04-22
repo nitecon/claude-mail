@@ -597,21 +597,44 @@ pub fn get_skill(conn: &Connection, name: &str) -> Result<Option<SkillRecord>> {
     Ok(rows.next().transpose()?)
 }
 
-pub fn list_skills(conn: &Connection) -> Result<Vec<SkillMeta>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT name, kind, size, checksum, uploaded_at FROM skills ORDER BY kind ASC, name ASC",
-    )?;
-    let collected = stmt
-        .query_map([], |r| {
-            Ok(SkillMeta {
-                name: r.get(0)?,
-                kind: r.get(1)?,
-                size: r.get(2)?,
-                checksum: r.get(3)?,
-                uploaded_at: r.get(4)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+/// List skill/command/agent metadata. Pass `Some(kind)` to restrict to a
+/// single kind (`"skill" | "command" | "agent"`); `None` returns everything.
+pub fn list_skills(conn: &Connection, kind: Option<&str>) -> Result<Vec<SkillMeta>> {
+    let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<SkillMeta> {
+        Ok(SkillMeta {
+            name: r.get(0)?,
+            kind: r.get(1)?,
+            size: r.get(2)?,
+            checksum: r.get(3)?,
+            uploaded_at: r.get(4)?,
+        })
+    };
+
+    let collected = match kind {
+        Some(k) => {
+            let mut stmt = conn.prepare_cached(
+                "SELECT name, kind, size, checksum, uploaded_at
+                 FROM skills
+                 WHERE kind = ?1
+                 ORDER BY name ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![k], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        }
+        None => {
+            let mut stmt = conn.prepare_cached(
+                "SELECT name, kind, size, checksum, uploaded_at
+                 FROM skills
+                 ORDER BY kind ASC, name ASC",
+            )?;
+            let rows = stmt
+                .query_map([], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        }
+    };
     Ok(collected)
 }
 
@@ -1211,4 +1234,137 @@ pub fn delete_task(conn: &Connection, project_ident: &str, task_id: &str) -> Res
         params![task_id, project_ident],
     )?;
     Ok(n > 0)
+}
+
+/// Current row snapshot read at the top of `reorder_tasks_in_column`:
+/// `(status, owner_agent_id, started_at, done_at)`.
+type TaskStateSnapshot = (String, Option<String>, Option<i64>, Option<i64>);
+
+/// Apply a client-driven order to one status column. For each id in `order`,
+/// set `status = target_status` and `rank = index` (0-based). Any status
+/// transition also maintains the invariants enforced by [`update_task`]:
+///
+/// - transitioning into `in_progress` sets `started_at = now`, auto-assigns
+///   `owner_agent_id = actor_agent_id` (when provided and the current owner
+///   is `NULL`),
+/// - transitioning into `done` sets `done_at = now`,
+/// - transitioning out of `done` clears `done_at`,
+/// - transitioning out of `in_progress` clears `started_at` and clears
+///   `owner_agent_id`.
+///
+/// All writes happen inside a single transaction; any id that does not exist
+/// in this project causes the whole batch to be rolled back via
+/// `anyhow::bail!`.
+pub fn reorder_tasks_in_column(
+    conn: &Connection,
+    project_ident: &str,
+    target_status: &str,
+    order: &[String],
+    actor_agent_id: Option<&str>,
+) -> Result<()> {
+    if target_status != "todo" && target_status != "in_progress" && target_status != "done" {
+        anyhow::bail!("invalid status '{target_status}': must be todo|in_progress|done");
+    }
+
+    if order.is_empty() {
+        return Ok(());
+    }
+
+    let now = now_ms();
+    let tx = conn.unchecked_transaction()?;
+
+    for (idx, task_id) in order.iter().enumerate() {
+        // Fetch current status + owner for this row, scoped to the project.
+        let current: Option<TaskStateSnapshot> = {
+            let mut stmt = tx.prepare(
+                "SELECT status, owner_agent_id, started_at, done_at
+                 FROM tasks WHERE id = ?1 AND project_ident = ?2",
+            )?;
+            let mut rows = stmt.query_map(params![task_id, project_ident], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                ))
+            })?;
+            rows.next().transpose()?
+        };
+
+        let (old_status, old_owner, old_started_at, old_done_at) = match current {
+            Some(v) => v,
+            None => anyhow::bail!("task '{task_id}' not found in project '{project_ident}'"),
+        };
+
+        // Compute new timestamps + owner by mirroring the transition logic
+        // in `update_task`. Fields we do not change are preserved explicitly
+        // (not cleared) — this handler only touches status/rank/timestamps.
+        let mut new_started_at = old_started_at;
+        let mut new_done_at = old_done_at;
+        let mut new_owner = old_owner.clone();
+
+        if old_status != target_status {
+            match (old_status.as_str(), target_status) {
+                ("todo", "in_progress") => {
+                    new_started_at = Some(now);
+                    new_done_at = None;
+                    if new_owner.is_none() {
+                        if let Some(aid) = actor_agent_id {
+                            new_owner = Some(aid.to_string());
+                        }
+                    }
+                }
+                ("in_progress", "todo") => {
+                    new_started_at = None;
+                    new_owner = None;
+                }
+                ("in_progress", "done") => {
+                    new_done_at = Some(now);
+                    // started_at stays put as a historical record of the
+                    // in_progress window; `update_task` behaves the same way
+                    // when transitioning directly to done.
+                }
+                ("todo", "done") => {
+                    new_done_at = Some(now);
+                }
+                ("done", "todo") => {
+                    new_done_at = None;
+                }
+                ("done", "in_progress") => {
+                    new_done_at = None;
+                    new_started_at = Some(now);
+                    if new_owner.is_none() {
+                        if let Some(aid) = actor_agent_id {
+                            new_owner = Some(aid.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        tx.execute(
+            "UPDATE tasks
+             SET status = ?1,
+                 rank = ?2,
+                 started_at = ?3,
+                 done_at = ?4,
+                 owner_agent_id = ?5,
+                 updated_at = ?6
+             WHERE id = ?7 AND project_ident = ?8",
+            params![
+                target_status,
+                idx as i64,
+                new_started_at,
+                new_done_at,
+                new_owner,
+                now,
+                task_id,
+                project_ident,
+            ],
+        )?;
+    }
+
+    tx.commit()?;
+    Ok(())
 }
