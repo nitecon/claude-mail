@@ -1,6 +1,6 @@
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
     Json,
@@ -877,6 +877,397 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
     );
 
     Ok(Html(html))
+}
+
+// ── Tasks API ────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct ListTasksQuery {
+    /// Comma-separated list of statuses (e.g. "todo,in_progress").
+    /// Defaults to `todo,in_progress` when absent.
+    pub status: Option<String>,
+    /// When true, include `done` tasks older than 7 days. Default false.
+    pub include_stale: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct CreateTaskRequest {
+    pub title: String,
+    pub description: Option<String>,
+    pub details: Option<String>,
+    pub labels: Option<Vec<String>>,
+    pub hostname: Option<String>,
+    /// Optional override of reporter. Defaults to X-Agent-Id header, or "user"
+    /// when the header is absent or "_default".
+    pub reporter: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateTaskRequest {
+    pub status: Option<String>,
+    /// `Some(null)` in JSON clears the owner; `Some("xyz")` assigns it;
+    /// absent leaves the current owner alone.
+    pub owner_agent_id: Option<serde_json::Value>,
+    pub rank: Option<i64>,
+    pub title: Option<String>,
+    pub description: Option<serde_json::Value>,
+    pub details: Option<serde_json::Value>,
+    pub labels: Option<Vec<String>>,
+    pub hostname: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+pub struct AddCommentRequest {
+    pub content: String,
+    /// `"agent"` | `"user"`. Defaults based on whether X-Agent-Id is present.
+    pub author_type: Option<String>,
+    /// Defaults to X-Agent-Id header, or `"user"` when the header is absent or
+    /// `"_default"`.
+    pub author: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ListTasksResponse {
+    pub tasks: Vec<db::TaskSummary>,
+}
+
+#[derive(Serialize)]
+pub struct TaskResponse {
+    pub task: db::Task,
+}
+
+#[derive(Serialize)]
+pub struct TaskDetailResponse {
+    pub task: db::Task,
+    pub comments: Vec<db::TaskComment>,
+}
+
+#[derive(Serialize)]
+pub struct CommentResponse {
+    pub comment: db::TaskComment,
+}
+
+#[derive(Serialize)]
+pub struct DeleteResponse {
+    pub deleted: bool,
+}
+
+/// Parse a JSON nullable-string update field.
+///
+/// - `None`                          → `None`        (field not touched)
+/// - `Some(Value::Null)`             → `Some(None)`  (clear column)
+/// - `Some(Value::String(s))`        → `Some(Some(s))` (set column)
+/// - anything else                   → 400
+fn decode_nullable_string(
+    field: &str,
+    value: Option<serde_json::Value>,
+) -> Result<Option<Option<String>>> {
+    match value {
+        None => Ok(None),
+        Some(serde_json::Value::Null) => Ok(Some(None)),
+        Some(serde_json::Value::String(s)) => Ok(Some(Some(s))),
+        Some(_) => Err(AppError(
+            StatusCode::BAD_REQUEST,
+            format!("'{field}' must be a string or null"),
+        )),
+    }
+}
+
+/// Resolve the reporter/author identity from an explicit body field, the
+/// X-Agent-Id header, or fall back to `"user"`.
+fn resolve_identity(explicit: Option<String>, headers: &HeaderMap) -> String {
+    if let Some(s) = explicit.and_then(|s| {
+        let t = s.trim().to_string();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t)
+        }
+    }) {
+        return s;
+    }
+    let hdr = extract_agent_id(headers);
+    if hdr == "_default" {
+        "user".to_string()
+    } else {
+        hdr
+    }
+}
+
+/// Optional agent id from header for actor-aware operations (None when the
+/// header is absent or is the sentinel "_default").
+fn actor_agent_id(headers: &HeaderMap) -> Option<String> {
+    let hdr = extract_agent_id(headers);
+    if hdr == "_default" {
+        None
+    } else {
+        Some(hdr)
+    }
+}
+
+pub async fn list_tasks_handler(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+    Query(q): Query<ListTasksQuery>,
+) -> Result<Json<ListTasksResponse>> {
+    // Verify project exists (consistent with other handlers).
+    {
+        let conn = state.db.lock().unwrap();
+        if db::get_project(&conn, &ident)?.is_none() {
+            return Err(AppError(
+                StatusCode::NOT_FOUND,
+                format!("project '{}' not found", ident),
+            ));
+        }
+    }
+
+    let statuses: Vec<String> = match q.status.as_deref() {
+        None | Some("") => vec!["todo".into(), "in_progress".into()],
+        Some(s) => s
+            .split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect(),
+    };
+    for s in &statuses {
+        if s != "todo" && s != "in_progress" && s != "done" {
+            return Err(AppError(
+                StatusCode::BAD_REQUEST,
+                format!("invalid status '{s}': must be todo|in_progress|done"),
+            ));
+        }
+    }
+    let include_stale = q.include_stale.unwrap_or(false);
+
+    let db = state.db.clone();
+    let ident_for_reclaim = ident.clone();
+    let ident_for_list = ident;
+    let tasks = spawn_blocking(move || -> anyhow::Result<Vec<db::TaskSummary>> {
+        let conn = db.lock().unwrap();
+        // Reclaim stale in-progress tasks before listing so clients see a
+        // consistent view.
+        db::reclaim_stale_tasks(&conn, &ident_for_reclaim)?;
+        db::list_tasks(&conn, &ident_for_list, &statuses, include_stale)
+    })
+    .await??;
+
+    Ok(Json(ListTasksResponse { tasks }))
+}
+
+pub async fn create_task_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(ident): Path<String>,
+    Json(req): Json<CreateTaskRequest>,
+) -> Result<Json<TaskResponse>> {
+    // Verify project exists.
+    {
+        let conn = state.db.lock().unwrap();
+        if db::get_project(&conn, &ident)?.is_none() {
+            return Err(AppError(
+                StatusCode::NOT_FOUND,
+                format!("project '{}' not found", ident),
+            ));
+        }
+    }
+
+    let title = req.title.trim().to_string();
+    if title.is_empty() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "'title' must be non-empty".into(),
+        ));
+    }
+
+    let reporter = resolve_identity(req.reporter, &headers);
+    let description = req.description;
+    let details = req.details;
+    let labels = req.labels.unwrap_or_default();
+    let hostname = req.hostname;
+
+    let db = state.db.clone();
+    let ident_clone = ident;
+    let task = spawn_blocking(move || -> anyhow::Result<db::Task> {
+        let conn = db.lock().unwrap();
+        db::insert_task(
+            &conn,
+            &ident_clone,
+            &title,
+            description.as_deref(),
+            details.as_deref(),
+            &labels,
+            hostname.as_deref(),
+            &reporter,
+        )
+    })
+    .await??;
+
+    Ok(Json(TaskResponse { task }))
+}
+
+pub async fn get_task_handler(
+    State(state): State<AppState>,
+    Path((ident, task_id)): Path<(String, String)>,
+) -> Result<Json<TaskDetailResponse>> {
+    let db = state.db.clone();
+    let ident_for_reclaim = ident.clone();
+    let ident_for_fetch = ident.clone();
+    let task_id_clone = task_id;
+    let detail = spawn_blocking(move || -> anyhow::Result<Option<db::TaskDetail>> {
+        let conn = db.lock().unwrap();
+        db::reclaim_stale_tasks(&conn, &ident_for_reclaim)?;
+        db::get_task_detail(&conn, &ident_for_fetch, &task_id_clone)
+    })
+    .await??;
+
+    match detail {
+        Some(d) => Ok(Json(TaskDetailResponse {
+            task: d.task,
+            comments: d.comments,
+        })),
+        None => Err(AppError(
+            StatusCode::NOT_FOUND,
+            format!("task not found in project '{}'", ident),
+        )),
+    }
+}
+
+pub async fn update_task_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((ident, task_id)): Path<(String, String)>,
+    Json(req): Json<UpdateTaskRequest>,
+) -> Result<Json<TaskResponse>> {
+    // Validate & decode the nullable-string fields up-front so we can return
+    // 400 on a client-side shape mistake rather than bubbling a 500.
+    let owner_opt = decode_nullable_string("owner_agent_id", req.owner_agent_id)?;
+    let description_opt = decode_nullable_string("description", req.description)?;
+    let details_opt = decode_nullable_string("details", req.details)?;
+    let hostname_opt = decode_nullable_string("hostname", req.hostname)?;
+
+    let actor = actor_agent_id(&headers);
+    let db = state.db.clone();
+    let ident_for_reclaim = ident.clone();
+    let ident_for_update = ident.clone();
+    let task_id_clone = task_id;
+    let status = req.status;
+    let rank = req.rank;
+    let title = req.title;
+    let labels = req.labels;
+
+    // Invalid status transitions and bad status values are currently reported
+    // by `db::update_task` as anyhow errors; they bubble through `AppError`'s
+    // blanket From impl as 500. The CHECK constraint on `status` catches the
+    // truly invalid values at the SQL layer. Refine to 400 when we add a
+    // dedicated error enum.
+    let task = spawn_blocking(move || -> anyhow::Result<Option<db::Task>> {
+        let conn = db.lock().unwrap();
+        db::reclaim_stale_tasks(&conn, &ident_for_reclaim)?;
+
+        let upd = db::TaskUpdate {
+            status: status.as_deref(),
+            owner_agent_id: owner_opt.as_ref().map(|inner| inner.as_deref()),
+            rank,
+            title: title.as_deref(),
+            description: description_opt.as_ref().map(|inner| inner.as_deref()),
+            details: details_opt.as_ref().map(|inner| inner.as_deref()),
+            labels: labels.as_deref(),
+            hostname: hostname_opt.as_ref().map(|inner| inner.as_deref()),
+        };
+        db::update_task(
+            &conn,
+            &ident_for_update,
+            &task_id_clone,
+            &upd,
+            actor.as_deref(),
+        )
+    })
+    .await??;
+
+    match task {
+        Some(t) => Ok(Json(TaskResponse { task: t })),
+        None => Err(AppError(
+            StatusCode::NOT_FOUND,
+            format!("task not found in project '{}'", ident),
+        )),
+    }
+}
+
+pub async fn add_comment_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((ident, task_id)): Path<(String, String)>,
+    Json(req): Json<AddCommentRequest>,
+) -> Result<Json<CommentResponse>> {
+    let content = req.content;
+    if content.trim().is_empty() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "'content' must be non-empty".into(),
+        ));
+    }
+
+    // Confirm the task exists in the project first.
+    {
+        let conn = state.db.lock().unwrap();
+        if db::get_project(&conn, &ident)?.is_none() {
+            return Err(AppError(
+                StatusCode::NOT_FOUND,
+                format!("project '{}' not found", ident),
+            ));
+        }
+        if db::get_task_detail(&conn, &ident, &task_id)?.is_none() {
+            return Err(AppError(
+                StatusCode::NOT_FOUND,
+                format!("task not found in project '{}'", ident),
+            ));
+        }
+    }
+
+    let header_agent = actor_agent_id(&headers);
+    let author = resolve_identity(req.author, &headers);
+    let author_type = match req.author_type.as_deref() {
+        Some("agent") => "agent".to_string(),
+        Some("user") => "user".to_string(),
+        Some(other) => {
+            return Err(AppError(
+                StatusCode::BAD_REQUEST,
+                format!("invalid author_type '{other}': must be agent|user"),
+            ));
+        }
+        None => {
+            if header_agent.is_some() {
+                "agent".into()
+            } else {
+                "user".into()
+            }
+        }
+    };
+
+    let db = state.db.clone();
+    let task_id_clone = task_id;
+    let comment = spawn_blocking(move || -> anyhow::Result<db::TaskComment> {
+        let conn = db.lock().unwrap();
+        db::insert_comment(&conn, &task_id_clone, &author, &author_type, &content)
+    })
+    .await??;
+
+    Ok(Json(CommentResponse { comment }))
+}
+
+pub async fn delete_task_handler(
+    State(state): State<AppState>,
+    Path((ident, task_id)): Path<(String, String)>,
+) -> Result<Json<DeleteResponse>> {
+    let db = state.db.clone();
+    let ident_clone = ident;
+    let task_id_clone = task_id;
+    let deleted = spawn_blocking(move || -> anyhow::Result<bool> {
+        let conn = db.lock().unwrap();
+        db::delete_task(&conn, &ident_clone, &task_id_clone)
+    })
+    .await??;
+    Ok(Json(DeleteResponse { deleted }))
 }
 
 // ── ndesign partials (shared by dashboard + manage) ──────────────────────────

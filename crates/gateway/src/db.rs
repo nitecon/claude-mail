@@ -171,6 +171,43 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         );",
     )?;
 
+    // ── Tasks: per-project kanban (todo/in_progress/done) ────────────────────
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS tasks (
+            id              TEXT PRIMARY KEY,
+            project_ident   TEXT NOT NULL REFERENCES projects(ident),
+            title           TEXT NOT NULL,
+            description     TEXT,
+            details         TEXT,
+            status          TEXT NOT NULL DEFAULT 'todo'
+                            CHECK(status IN ('todo','in_progress','done')),
+            rank            INTEGER NOT NULL DEFAULT 0,
+            labels          TEXT,
+            hostname        TEXT,
+            owner_agent_id  TEXT,
+            reporter        TEXT NOT NULL,
+            created_at      INTEGER NOT NULL,
+            updated_at      INTEGER NOT NULL,
+            started_at      INTEGER,
+            done_at         INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_tasks_project_status
+            ON tasks(project_ident, status);
+        CREATE INDEX IF NOT EXISTS idx_tasks_project_rank
+            ON tasks(project_ident, status, rank);
+
+        CREATE TABLE IF NOT EXISTS task_comments (
+            id           TEXT PRIMARY KEY,
+            task_id      TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            author       TEXT NOT NULL,
+            author_type  TEXT NOT NULL CHECK(author_type IN ('agent','user','system')),
+            content      TEXT NOT NULL,
+            created_at   INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_task_comments_task
+            ON task_comments(task_id, created_at);",
+    )?;
+
     Ok(())
 }
 
@@ -580,5 +617,598 @@ pub fn list_skills(conn: &Connection) -> Result<Vec<SkillMeta>> {
 
 pub fn delete_skill(conn: &Connection, name: &str) -> Result<bool> {
     let n = conn.execute("DELETE FROM skills WHERE name = ?1", params![name])?;
+    Ok(n > 0)
+}
+
+// ── Tasks ─────────────────────────────────────────────────────────────────────
+
+/// How long an `in_progress` task with no activity before it is considered
+/// abandoned and returned to `todo` by `reclaim_stale_tasks`.
+pub const TASK_RECLAIM_MS: i64 = 60 * 60 * 1000; // 1 hour
+/// How long a `done` task remains in the default list view before it falls off.
+pub const TASK_DONE_FALLOFF_MS: i64 = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Task {
+    pub id: String,
+    pub project_ident: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub details: Option<String>,
+    /// One of `"todo"`, `"in_progress"`, `"done"`.
+    pub status: String,
+    pub rank: i64,
+    /// Parsed from the JSON-array-encoded `labels` column; empty when the
+    /// column is NULL or malformed.
+    pub labels: Vec<String>,
+    pub hostname: Option<String>,
+    pub owner_agent_id: Option<String>,
+    pub reporter: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub started_at: Option<i64>,
+    pub done_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskComment {
+    pub id: String,
+    pub task_id: String,
+    pub author: String,
+    /// One of `"agent"`, `"user"`, `"system"`.
+    pub author_type: String,
+    pub content: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskSummary {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub rank: i64,
+    pub labels: Vec<String>,
+    pub owner_agent_id: Option<String>,
+    pub hostname: Option<String>,
+    pub reporter: String,
+    pub comment_count: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskDetail {
+    pub task: Task,
+    pub comments: Vec<TaskComment>,
+}
+
+/// Dynamic update payload for `update_task`. `None` on any field means
+/// "do not touch"; for the `Option<Option<_>>` fields, `Some(None)` means
+/// "clear the column" and `Some(Some(x))` means "set to x".
+pub struct TaskUpdate<'a> {
+    pub status: Option<&'a str>,
+    pub owner_agent_id: Option<Option<&'a str>>,
+    pub rank: Option<i64>,
+    pub title: Option<&'a str>,
+    pub description: Option<Option<&'a str>>,
+    pub details: Option<Option<&'a str>>,
+    pub labels: Option<&'a [String]>,
+    pub hostname: Option<Option<&'a str>>,
+}
+
+fn new_uuid() -> String {
+    uuid::Uuid::now_v7().to_string()
+}
+
+fn serialize_labels(labels: &[String]) -> Option<String> {
+    if labels.is_empty() {
+        None
+    } else {
+        serde_json::to_string(labels).ok()
+    }
+}
+
+fn parse_labels(raw: Option<String>) -> Vec<String> {
+    match raw {
+        Some(s) => serde_json::from_str::<Vec<String>>(&s).unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
+    Ok(Task {
+        id: row.get(0)?,
+        project_ident: row.get(1)?,
+        title: row.get(2)?,
+        description: row.get(3)?,
+        details: row.get(4)?,
+        status: row.get(5)?,
+        rank: row.get(6)?,
+        labels: parse_labels(row.get::<_, Option<String>>(7)?),
+        hostname: row.get(8)?,
+        owner_agent_id: row.get(9)?,
+        reporter: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+        started_at: row.get(13)?,
+        done_at: row.get(14)?,
+    })
+}
+
+const TASK_SELECT_COLS: &str =
+    "id, project_ident, title, description, details, status, rank, labels, \
+     hostname, owner_agent_id, reporter, created_at, updated_at, started_at, done_at";
+
+/// Reclaim any task in this project that has been `in_progress` for longer than
+/// [`TASK_RECLAIM_MS`] without any `updated_at` activity. Reclaimed tasks are
+/// flipped back to `todo`, the owner is cleared, and a system comment is
+/// appended so the next agent knows to verify prior progress. Runs in a single
+/// transaction.
+pub fn reclaim_stale_tasks(conn: &Connection, project_ident: &str) -> Result<usize> {
+    let now = now_ms();
+    let cutoff = now - TASK_RECLAIM_MS;
+
+    let tx = conn.unchecked_transaction()?;
+    let stale_ids: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT id FROM tasks
+             WHERE project_ident = ?1
+               AND status = 'in_progress'
+               AND started_at IS NOT NULL
+               AND started_at < ?2
+               AND updated_at < ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![project_ident, cutoff], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    if stale_ids.is_empty() {
+        tx.commit()?;
+        return Ok(0);
+    }
+
+    let comment_body = "Reclaimed after 1h of inactivity. Next agent please \
+                        verify prior progress before continuing.";
+
+    for task_id in &stale_ids {
+        tx.execute(
+            "INSERT INTO task_comments (id, task_id, author, author_type, content, created_at)
+             VALUES (?1, ?2, 'system', 'system', ?3, ?4)",
+            params![new_uuid(), task_id, comment_body, now],
+        )?;
+        tx.execute(
+            "UPDATE tasks
+             SET status = 'todo',
+                 owner_agent_id = NULL,
+                 started_at = NULL,
+                 updated_at = ?1
+             WHERE id = ?2",
+            params![now, task_id],
+        )?;
+    }
+
+    tx.commit()?;
+    Ok(stale_ids.len())
+}
+
+/// Insert a new task in the `todo` column. Rank is auto-assigned as
+/// `MAX(rank) + 1` among existing `todo` rows for this project.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_task(
+    conn: &Connection,
+    project_ident: &str,
+    title: &str,
+    description: Option<&str>,
+    details: Option<&str>,
+    labels: &[String],
+    hostname: Option<&str>,
+    reporter: &str,
+) -> Result<Task> {
+    let id = new_uuid();
+    let now = now_ms();
+    let labels_json = serialize_labels(labels);
+
+    let rank: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(rank), 0) + 1 FROM tasks
+         WHERE project_ident = ?1 AND status = 'todo'",
+        params![project_ident],
+        |r| r.get(0),
+    )?;
+
+    conn.execute(
+        "INSERT INTO tasks (
+             id, project_ident, title, description, details, status, rank,
+             labels, hostname, owner_agent_id, reporter,
+             created_at, updated_at, started_at, done_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'todo', ?6, ?7, ?8, NULL, ?9, ?10, ?10, NULL, NULL)",
+        params![
+            id,
+            project_ident,
+            title,
+            description,
+            details,
+            rank,
+            labels_json,
+            hostname,
+            reporter,
+            now,
+        ],
+    )?;
+
+    Ok(Task {
+        id,
+        project_ident: project_ident.to_string(),
+        title: title.to_string(),
+        description: description.map(str::to_string),
+        details: details.map(str::to_string),
+        status: "todo".to_string(),
+        rank,
+        labels: labels.to_vec(),
+        hostname: hostname.map(str::to_string),
+        owner_agent_id: None,
+        reporter: reporter.to_string(),
+        created_at: now,
+        updated_at: now,
+        started_at: None,
+        done_at: None,
+    })
+}
+
+/// List task summaries for a project filtered by status. When `statuses`
+/// contains `"done"` and `include_stale_done` is false, only done tasks whose
+/// `done_at > now - 7d` are returned. Results are sorted by `rank ASC` then
+/// `updated_at DESC`.
+pub fn list_tasks(
+    conn: &Connection,
+    project_ident: &str,
+    statuses: &[String],
+    include_stale_done: bool,
+) -> Result<Vec<TaskSummary>> {
+    if statuses.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Build an IN (?, ?, ...) clause. Placeholders start at 2 because
+    // placeholder 1 is project_ident. A trailing `done_cutoff` placeholder is
+    // appended when we need to filter stale-done rows.
+    let mut placeholders = Vec::with_capacity(statuses.len());
+    for i in 0..statuses.len() {
+        placeholders.push(format!("?{}", i + 2));
+    }
+    let in_clause = placeholders.join(",");
+
+    let has_done = statuses.iter().any(|s| s == "done");
+    let apply_done_filter = has_done && !include_stale_done;
+
+    let sql = if apply_done_filter {
+        let cutoff_ph = statuses.len() + 2;
+        format!(
+            "SELECT t.id, t.title, t.status, t.rank, t.labels,
+                    t.owner_agent_id, t.hostname, t.reporter,
+                    (SELECT COUNT(*) FROM task_comments tc WHERE tc.task_id = t.id),
+                    t.created_at, t.updated_at
+             FROM tasks t
+             WHERE t.project_ident = ?1
+               AND t.status IN ({in_clause})
+               AND (t.status != 'done' OR (t.done_at IS NOT NULL AND t.done_at > ?{cutoff_ph}))
+             ORDER BY t.rank ASC, t.updated_at DESC"
+        )
+    } else {
+        format!(
+            "SELECT t.id, t.title, t.status, t.rank, t.labels,
+                    t.owner_agent_id, t.hostname, t.reporter,
+                    (SELECT COUNT(*) FROM task_comments tc WHERE tc.task_id = t.id),
+                    t.created_at, t.updated_at
+             FROM tasks t
+             WHERE t.project_ident = ?1
+               AND t.status IN ({in_clause})
+             ORDER BY t.rank ASC, t.updated_at DESC"
+        )
+    };
+
+    // Bind params: project_ident, statuses..., [done_cutoff]
+    let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(statuses.len() + 2);
+    bound.push(Box::new(project_ident.to_string()));
+    for s in statuses {
+        bound.push(Box::new(s.clone()));
+    }
+    if apply_done_filter {
+        bound.push(Box::new(now_ms() - TASK_DONE_FALLOFF_MS));
+    }
+    let params_vec: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|b| b.as_ref()).collect();
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params_vec.as_slice(), |r| {
+            Ok(TaskSummary {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                status: r.get(2)?,
+                rank: r.get(3)?,
+                labels: parse_labels(r.get::<_, Option<String>>(4)?),
+                owner_agent_id: r.get(5)?,
+                hostname: r.get(6)?,
+                reporter: r.get(7)?,
+                comment_count: r.get(8)?,
+                created_at: r.get(9)?,
+                updated_at: r.get(10)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(rows)
+}
+
+/// Fetch a task and all of its comments, scoped by `project_ident` for safety.
+/// Comments are ordered ascending by `created_at`.
+pub fn get_task_detail(
+    conn: &Connection,
+    project_ident: &str,
+    task_id: &str,
+) -> Result<Option<TaskDetail>> {
+    let task = {
+        let sql =
+            format!("SELECT {TASK_SELECT_COLS} FROM tasks WHERE id = ?1 AND project_ident = ?2");
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query_map(params![task_id, project_ident], row_to_task)?;
+        match rows.next() {
+            Some(r) => r?,
+            None => return Ok(None),
+        }
+    };
+
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, task_id, author, author_type, content, created_at
+         FROM task_comments
+         WHERE task_id = ?1
+         ORDER BY created_at ASC",
+    )?;
+    let comments = stmt
+        .query_map(params![task_id], |r| {
+            Ok(TaskComment {
+                id: r.get(0)?,
+                task_id: r.get(1)?,
+                author: r.get(2)?,
+                author_type: r.get(3)?,
+                content: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(Some(TaskDetail { task, comments }))
+}
+
+/// Apply a partial update to a task, enforcing status-transition side effects
+/// (auto-set `started_at`/`owner_agent_id` on todo→in_progress, `done_at` on
+/// `* → done`, clearing of timestamps on reverse transitions, etc.). Returns
+/// the refreshed task, or `Ok(None)` if no such task exists in that project.
+/// Invalid status strings or impossible transitions bubble up via
+/// `anyhow::bail!`.
+pub fn update_task(
+    conn: &Connection,
+    project_ident: &str,
+    task_id: &str,
+    upd: &TaskUpdate<'_>,
+    actor_agent_id: Option<&str>,
+) -> Result<Option<Task>> {
+    // Validate requested status early.
+    if let Some(s) = upd.status {
+        if s != "todo" && s != "in_progress" && s != "done" {
+            anyhow::bail!("invalid status '{s}': must be todo|in_progress|done");
+        }
+    }
+
+    // Load current state scoped to project for safety.
+    let current = {
+        let sql =
+            format!("SELECT {TASK_SELECT_COLS} FROM tasks WHERE id = ?1 AND project_ident = ?2");
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query_map(params![task_id, project_ident], row_to_task)?;
+        match rows.next() {
+            Some(r) => r?,
+            None => return Ok(None),
+        }
+    };
+
+    let now = now_ms();
+    let new_status = upd.status.unwrap_or(&current.status).to_string();
+    let owner_explicit = upd.owner_agent_id.is_some();
+    let transitioning = upd.status.is_some() && new_status != current.status;
+
+    // Compute derived fields based on the transition.
+    // started_at: Some(Some(v)) = set, Some(None) = clear, None = leave alone
+    #[allow(clippy::type_complexity)]
+    let mut started_at: Option<Option<i64>> = None;
+    let mut done_at: Option<Option<i64>> = None;
+    // owner: mirrors TaskUpdate's owner semantics, starting from upd.owner_agent_id.
+    let mut owner: Option<Option<String>> =
+        upd.owner_agent_id.map(|inner| inner.map(|s| s.to_string()));
+
+    if transitioning {
+        match (current.status.as_str(), new_status.as_str()) {
+            ("todo", "in_progress") => {
+                started_at = Some(Some(now));
+                done_at = Some(None);
+                if !owner_explicit {
+                    if let Some(aid) = actor_agent_id {
+                        owner = Some(Some(aid.to_string()));
+                    }
+                }
+            }
+            ("in_progress", "todo") => {
+                started_at = Some(None);
+                if !owner_explicit {
+                    owner = Some(None);
+                }
+            }
+            (_, "done") => {
+                done_at = Some(Some(now));
+            }
+            ("done", "todo") | ("done", "in_progress") => {
+                done_at = Some(None);
+                if new_status == "in_progress" {
+                    started_at = Some(Some(now));
+                    if !owner_explicit {
+                        if let Some(aid) = actor_agent_id {
+                            owner = Some(Some(aid.to_string()));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Build dynamic UPDATE.
+    let mut sets: Vec<String> = Vec::new();
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    let push = |col: &str,
+                val: Box<dyn rusqlite::ToSql>,
+                sets: &mut Vec<String>,
+                binds: &mut Vec<Box<dyn rusqlite::ToSql>>| {
+        binds.push(val);
+        sets.push(format!("{col} = ?{}", binds.len()));
+    };
+
+    if let Some(title) = upd.title {
+        push("title", Box::new(title.to_string()), &mut sets, &mut binds);
+    }
+    if let Some(desc) = upd.description {
+        push(
+            "description",
+            Box::new(desc.map(str::to_string)),
+            &mut sets,
+            &mut binds,
+        );
+    }
+    if let Some(det) = upd.details {
+        push(
+            "details",
+            Box::new(det.map(str::to_string)),
+            &mut sets,
+            &mut binds,
+        );
+    }
+    if let Some(labels) = upd.labels {
+        push(
+            "labels",
+            Box::new(serialize_labels(labels)),
+            &mut sets,
+            &mut binds,
+        );
+    }
+    if let Some(host) = upd.hostname {
+        push(
+            "hostname",
+            Box::new(host.map(str::to_string)),
+            &mut sets,
+            &mut binds,
+        );
+    }
+    if upd.status.is_some() {
+        push(
+            "status",
+            Box::new(new_status.clone()),
+            &mut sets,
+            &mut binds,
+        );
+    }
+    if let Some(rank) = upd.rank {
+        push("rank", Box::new(rank), &mut sets, &mut binds);
+    }
+    if let Some(owner_val) = owner {
+        push("owner_agent_id", Box::new(owner_val), &mut sets, &mut binds);
+    }
+    if let Some(started) = started_at {
+        push("started_at", Box::new(started), &mut sets, &mut binds);
+    }
+    if let Some(done) = done_at {
+        push("done_at", Box::new(done), &mut sets, &mut binds);
+    }
+
+    // Always bump updated_at.
+    push("updated_at", Box::new(now), &mut sets, &mut binds);
+
+    if sets.is_empty() {
+        // Nothing to update — just return the current row.
+        return Ok(Some(current));
+    }
+
+    // WHERE bindings come last.
+    binds.push(Box::new(task_id.to_string()));
+    let id_ph = binds.len();
+    binds.push(Box::new(project_ident.to_string()));
+    let proj_ph = binds.len();
+
+    let sql = format!(
+        "UPDATE tasks SET {} WHERE id = ?{} AND project_ident = ?{}",
+        sets.join(", "),
+        id_ph,
+        proj_ph,
+    );
+
+    let params_vec: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+    let n = conn.execute(&sql, params_vec.as_slice())?;
+    if n == 0 {
+        return Ok(None);
+    }
+
+    // Re-read the row to return a fully-consistent Task.
+    let sql = format!("SELECT {TASK_SELECT_COLS} FROM tasks WHERE id = ?1 AND project_ident = ?2");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query_map(params![task_id, project_ident], row_to_task)?;
+    Ok(rows.next().transpose()?)
+}
+
+/// Append a comment to a task and bump the parent task's `updated_at`. Runs
+/// inside a single transaction. `author_type` must be `"agent"`, `"user"`, or
+/// `"system"`.
+pub fn insert_comment(
+    conn: &Connection,
+    task_id: &str,
+    author: &str,
+    author_type: &str,
+    content: &str,
+) -> Result<TaskComment> {
+    if author_type != "agent" && author_type != "user" && author_type != "system" {
+        anyhow::bail!("invalid author_type '{author_type}': must be agent|user|system");
+    }
+
+    let id = new_uuid();
+    let now = now_ms();
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO task_comments (id, task_id, author, author_type, content, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![id, task_id, author, author_type, content, now],
+    )?;
+    tx.execute(
+        "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
+        params![now, task_id],
+    )?;
+    tx.commit()?;
+
+    Ok(TaskComment {
+        id,
+        task_id: task_id.to_string(),
+        author: author.to_string(),
+        author_type: author_type.to_string(),
+        content: content.to_string(),
+        created_at: now,
+    })
+}
+
+/// Delete a task (and its comments via ON DELETE CASCADE) scoped to a project.
+/// Returns true if a row was removed.
+pub fn delete_task(conn: &Connection, project_ident: &str, task_id: &str) -> Result<bool> {
+    let n = conn.execute(
+        "DELETE FROM tasks WHERE id = ?1 AND project_ident = ?2",
+        params![task_id, project_ident],
+    )?;
     Ok(n > 0)
 }

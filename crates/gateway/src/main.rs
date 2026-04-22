@@ -352,6 +352,20 @@ async fn main() -> Result<()> {
                 .delete(routes::delete_skill_handler),
         )
         .route("/v1/skills/{name}/content", get(routes::get_skill_content))
+        .route(
+            "/v1/projects/{ident}/tasks",
+            get(routes::list_tasks_handler).post(routes::create_task_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/tasks/{id}",
+            get(routes::get_task_handler)
+                .patch(routes::update_task_handler)
+                .delete(routes::delete_task_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/tasks/{id}/comments",
+            post(routes::add_comment_handler),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), bearer_auth));
 
     // Dashboard and manage page are public (local admin pages, no auth required).
