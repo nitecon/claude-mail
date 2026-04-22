@@ -466,6 +466,7 @@ pub fn now_ms() -> i64 {
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
 
+#[derive(serde::Serialize)]
 pub struct ProjectStats {
     pub ident: String,
     pub channel_name: String,
@@ -474,6 +475,7 @@ pub struct ProjectStats {
     pub unread_count: i64,
 }
 
+#[derive(serde::Serialize)]
 pub struct DashboardData {
     pub project_count: i64,
     pub total_messages: i64,
@@ -483,21 +485,13 @@ pub struct DashboardData {
     pub projects: Vec<ProjectStats>,
 }
 
-pub fn get_dashboard_data(conn: &Connection) -> Result<DashboardData> {
-    let project_count: i64 = conn.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))?;
-    let total_messages: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?;
-    let agent_messages: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM messages WHERE source='agent'",
-        [],
-        |r| r.get(0),
-    )?;
-    let user_messages: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM messages WHERE source='user'",
-        [],
-        |r| r.get(0),
-    )?;
-    let skill_count: i64 = conn.query_row("SELECT COUNT(*) FROM skills", [], |r| r.get(0))?;
-
+/// Return per-project stats ordered by most-recently-created first.
+///
+/// Shared by the HTML dashboard (via [`get_dashboard_data`]) and the JSON
+/// helper endpoint the task picker binds to. Each row contains the project's
+/// identity, its channel, the originating room id, the total message count,
+/// and the number of unconfirmed user-sourced messages.
+pub fn list_project_stats(conn: &Connection) -> Result<Vec<ProjectStats>> {
     let mut stmt = conn.prepare_cached(
         "SELECT p.ident, p.channel_name, p.room_id,
                 COUNT(m.id),
@@ -521,6 +515,25 @@ pub fn get_dashboard_data(conn: &Connection) -> Result<DashboardData> {
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(projects)
+}
+
+pub fn get_dashboard_data(conn: &Connection) -> Result<DashboardData> {
+    let project_count: i64 = conn.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))?;
+    let total_messages: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?;
+    let agent_messages: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE source='agent'",
+        [],
+        |r| r.get(0),
+    )?;
+    let user_messages: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE source='user'",
+        [],
+        |r| r.get(0),
+    )?;
+    let skill_count: i64 = conn.query_row("SELECT COUNT(*) FROM skills", [], |r| r.get(0))?;
+
+    let projects = list_project_stats(conn)?;
 
     Ok(DashboardData {
         project_count,

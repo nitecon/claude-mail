@@ -326,7 +326,10 @@ async fn main() -> Result<()> {
 
     // API routes require bearer auth.
     let api = Router::new()
-        .route("/v1/projects", post(routes::register_project))
+        .route(
+            "/v1/projects",
+            get(routes::list_projects_handler).post(routes::register_project),
+        )
         .route("/v1/projects/{ident}/messages", post(routes::send_message))
         .route(
             "/v1/projects/{ident}/messages/unread",
@@ -380,6 +383,12 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/", get(routes::dashboard))
         .route("/manage", get(routes::manage_page))
+        .route("/tasks", get(routes::tasks_picker))
+        .route("/projects/{ident}/tasks", get(routes::tasks_board))
+        .route(
+            "/projects/{ident}/tasks/{id}",
+            get(routes::task_detail_page),
+        )
         .route("/theme", get(routes::get_theme).post(routes::set_theme))
         .merge(api)
         .with_state(state);

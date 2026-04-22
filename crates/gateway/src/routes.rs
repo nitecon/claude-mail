@@ -1472,6 +1472,421 @@ pub async fn reorder_tasks_handler(
     Ok(Json(tasks))
 }
 
+// ── GET /v1/projects (JSON — used by the Tasks picker binding) ───────────────
+
+/// List all registered projects with the same per-project stats shape the
+/// dashboard uses. Returned as a bare array (no envelope) so ndesign's
+/// `data-nd-bind` can render rows directly.
+pub async fn list_projects_handler(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<db::ProjectStats>>> {
+    let db = state.db.clone();
+    let projects = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::list_project_stats(&conn)
+    })
+    .await??;
+    Ok(Json(projects))
+}
+
+// ── GET /tasks (project picker) ──────────────────────────────────────────────
+
+/// Render the project picker — a small table that the ndesign runtime
+/// hydrates from `GET /v1/projects`. The authenticated XHR is carried by the
+/// `Authorization` header emitted by `NDesign.configure` in
+/// `control_panel_close`.
+pub async fn tasks_picker(State(state): State<AppState>) -> Result<Html<String>> {
+    let db = state.db.clone();
+    let theme = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::get_theme(&conn)
+    })
+    .await??;
+
+    let content = r##"  <section class="nd-card">
+    <div class="nd-card-header"><strong>Projects</strong></div>
+    <div class="nd-card-body nd-p-0">
+      <table class="nd-table nd-table-hover">
+        <thead>
+          <tr><th>Project</th><th>Channel</th><th>Messages</th><th></th></tr>
+        </thead>
+        <tbody id="project-picker-body"
+               data-nd-bind="/v1/projects"
+               data-nd-template="project-row">
+          <template id="project-row">
+            <tr>
+              <td>{{ident}}</td>
+              <td class="nd-text-muted">{{channel_name}}</td>
+              <td>{{total_messages}}</td>
+              <td>
+                <a class="nd-btn-primary nd-btn-sm" href="/projects/{{ident}}/tasks">
+                  Open board
+                </a>
+              </td>
+            </tr>
+          </template>
+          <template data-nd-empty>
+            <tr><td colspan="4" class="nd-text-muted">No projects registered yet.</td></tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+  </section>"##;
+
+    let html = format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
+        head = control_panel_head("agent-gateway — Tasks", &theme),
+        open = control_panel_open("Tasks", "tasks"),
+        content = content,
+        close = control_panel_close(&state.api_key),
+    );
+    Ok(Html(html))
+}
+
+// ── GET /projects/:ident/tasks (board) ───────────────────────────────────────
+
+/// Render the three-column task board for a single project.
+///
+/// The columns bind to `GET /v1/projects/:ident/tasks?status=…` and the
+/// drag-and-drop reorder posts to `POST /v1/projects/:ident/tasks/reorder?status=…`.
+/// Returns 404 when the project is not registered.
+pub async fn tasks_board(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+) -> Result<Html<String>> {
+    let db_handle = state.db.clone();
+    let ident_for_lookup = ident.clone();
+    let (project, theme) = spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = db_handle.lock().unwrap();
+        let project = db::get_project(&conn, &ident_for_lookup)?;
+        let theme = db::get_theme(&conn)?;
+        Ok((project, theme))
+    })
+    .await??;
+
+    let project = project.ok_or_else(|| {
+        AppError(
+            StatusCode::NOT_FOUND,
+            format!("project '{}' not found", ident),
+        )
+    })?;
+
+    // `ident` is produced by `sanitize_ident` (enforced at registration
+    // time, see `register_project`) so it is already safe for URLs. We still
+    // HTML-escape before emitting into attribute values and text nodes as
+    // defense in depth.
+    let ident_attr = he(&project.ident);
+    let page_title = format!("Tasks — {}", project.ident);
+
+    // NOTE: ndesign renders `data-nd-bind` results into the same element that
+    // declares `data-nd-sortable`. When a card is dragged from the TODO column
+    // into IN PROGRESS, only the destination column's reorder POST fires; the
+    // source column keeps the stale node in its DOM until the next manual
+    // refresh. Fixing this requires a follow-up in the ndesign runtime, not
+    // per-page JS — see the task detail page for the manual-refresh story.
+    let content = format!(
+        r##"  <div class="nd-flex nd-gap-md nd-mb-md">
+    <a class="nd-btn-ghost nd-btn-sm" href="/tasks">← All projects</a>
+    <button class="nd-btn-primary nd-btn-sm" data-nd-modal="#new-task-modal">+ New task</button>
+  </div>
+
+  <!-- Shared card template used by all three columns. -->
+  <template id="task-card">
+    <li class="nd-card nd-mb-sm" data-id="{{{{id}}}}">
+      <div class="nd-card-body">
+        <a href="/projects/{ident}/tasks/{{{{id}}}}" class="nd-text-base nd-font-bold">{{{{title}}}}</a>
+        <div class="nd-text-muted nd-text-sm">
+          {{{{owner_agent_id}}}} · {{{{hostname}}}} · {{{{comment_count}}}} comments
+        </div>
+      </div>
+    </li>
+  </template>
+
+  <!--
+    Known limitation: cross-column drags update the destination column only;
+    the source column still shows the moved card until reload. The fix lives
+    in the ndesign runtime's reorder handler, not this page.
+  -->
+  <div class="nd-row nd-gap-md">
+    <section class="nd-card nd-col-4">
+      <div class="nd-card-header"><strong>TODO</strong></div>
+      <ul class="nd-card-body"
+          id="col-todo"
+          data-nd-bind="/v1/projects/{ident}/tasks?status=todo"
+          data-nd-template="task-card"
+          data-nd-sortable="POST /v1/projects/{ident}/tasks/reorder?status=todo">
+        <template data-nd-empty>
+          <li class="nd-text-muted nd-text-sm">No tasks.</li>
+        </template>
+      </ul>
+    </section>
+
+    <section class="nd-card nd-col-4">
+      <div class="nd-card-header"><strong>IN PROGRESS</strong></div>
+      <ul class="nd-card-body"
+          id="col-in_progress"
+          data-nd-bind="/v1/projects/{ident}/tasks?status=in_progress"
+          data-nd-template="task-card"
+          data-nd-sortable="POST /v1/projects/{ident}/tasks/reorder?status=in_progress">
+        <template data-nd-empty>
+          <li class="nd-text-muted nd-text-sm">No tasks.</li>
+        </template>
+      </ul>
+    </section>
+
+    <section class="nd-card nd-col-4">
+      <div class="nd-card-header"><strong>DONE</strong></div>
+      <ul class="nd-card-body"
+          id="col-done"
+          data-nd-bind="/v1/projects/{ident}/tasks?status=done"
+          data-nd-template="task-card"
+          data-nd-sortable="POST /v1/projects/{ident}/tasks/reorder?status=done">
+        <template data-nd-empty>
+          <li class="nd-text-muted nd-text-sm">No tasks.</li>
+        </template>
+      </ul>
+    </section>
+  </div>
+
+  <dialog id="new-task-modal" class="nd-modal">
+    <form data-nd-action="POST /v1/projects/{ident}/tasks"
+          data-nd-success="close-modal,refresh:#col-todo,reset">
+      <h3>New task</h3>
+      <div class="nd-form-group">
+        <label for="new-title">Title</label>
+        <input id="new-title" name="title" required>
+      </div>
+      <div class="nd-form-group">
+        <label for="new-description">Description</label>
+        <textarea id="new-description" name="description" rows="3"></textarea>
+      </div>
+      <div class="nd-form-group">
+        <label for="new-details">Details</label>
+        <textarea id="new-details" name="details" rows="6"></textarea>
+      </div>
+      <menu>
+        <button type="button" data-nd-dismiss class="nd-btn-ghost">Cancel</button>
+        <button type="submit" class="nd-btn-primary">Create</button>
+      </menu>
+    </form>
+  </dialog>"##,
+        ident = ident_attr,
+    );
+
+    let html = format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
+        head = control_panel_head(&page_title, &theme),
+        open = control_panel_open(&page_title, "tasks"),
+        content = content,
+        close = control_panel_close(&state.api_key),
+    );
+    Ok(Html(html))
+}
+
+// ── GET /projects/:ident/tasks/:id (task detail — server-rendered) ───────────
+
+/// Format an optional epoch-millis timestamp as RFC-3339 UTC. Returns an
+/// em dash when the value is `None` or outside chrono's representable range.
+fn format_ts_ms(ms: Option<i64>) -> String {
+    ms.and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .map(|d| d.to_rfc3339())
+        .unwrap_or_else(|| "—".to_string())
+}
+
+/// Render a detail page for a single task. All strings that originate from the
+/// database (title, description, details, comment content, agent ids) flow
+/// through `he()` before being interpolated into HTML to defeat XSS.
+///
+/// The page is fully server-rendered — no `data-nd-bind` — because there is
+/// no matching GET endpoint for "comments of one task". Claim/Release/Done/
+/// Reopen buttons use `data-nd-action` / `data-nd-success="reload"` so the
+/// page refreshes after the PATCH completes.
+pub async fn task_detail_page(
+    State(state): State<AppState>,
+    Path((ident, task_id)): Path<(String, String)>,
+) -> Result<Html<String>> {
+    let db_handle = state.db.clone();
+    let ident_for_lookup = ident.clone();
+    let ident_for_reclaim = ident.clone();
+    let ident_for_fetch = ident.clone();
+    let task_id_clone = task_id.clone();
+
+    let (project, detail, theme) = spawn_blocking(
+        move || -> anyhow::Result<(Option<db::Project>, Option<db::TaskDetail>, String)> {
+            let conn = db_handle.lock().unwrap();
+            let project = db::get_project(&conn, &ident_for_lookup)?;
+            if project.is_none() {
+                return Ok((None, None, db::get_theme(&conn)?));
+            }
+            db::reclaim_stale_tasks(&conn, &ident_for_reclaim)?;
+            let detail = db::get_task_detail(&conn, &ident_for_fetch, &task_id_clone)?;
+            let theme = db::get_theme(&conn)?;
+            Ok((project, detail, theme))
+        },
+    )
+    .await??;
+
+    let project = project.ok_or_else(|| {
+        AppError(
+            StatusCode::NOT_FOUND,
+            format!("project '{}' not found", ident),
+        )
+    })?;
+    let detail = detail.ok_or_else(|| {
+        AppError(
+            StatusCode::NOT_FOUND,
+            format!("task not found in project '{}'", ident),
+        )
+    })?;
+
+    let ident_attr = he(&project.ident);
+    let task = &detail.task;
+    let task_id_attr = he(&task.id);
+    let title = he(&task.title);
+    let status = he(&task.status);
+    let reporter = he(&task.reporter);
+    let owner = task
+        .owner_agent_id
+        .as_deref()
+        .map(he)
+        .unwrap_or_else(|| "—".to_string());
+    let description_block = match task.description.as_deref() {
+        Some(d) if !d.is_empty() => format!("<p>{}</p>", he(d)),
+        _ => r#"<p class="nd-text-muted">—</p>"#.to_string(),
+    };
+    let details_block = match task.details.as_deref() {
+        Some(d) if !d.is_empty() => format!("<pre class=\"nd-text-sm\">{}</pre>", he(d)),
+        _ => r#"<p class="nd-text-muted">—</p>"#.to_string(),
+    };
+
+    // Conditional action buttons keyed off current status.
+    let action_buttons = match task.status.as_str() {
+        "todo" => format!(
+            r##"<button class="nd-btn-primary nd-btn-sm"
+        data-nd-action="PATCH /v1/projects/{ident}/tasks/{tid}"
+        data-nd-body='{{"status":"in_progress"}}'
+        data-nd-success="reload">Claim</button>
+      <button class="nd-btn-primary nd-btn-sm"
+        data-nd-action="PATCH /v1/projects/{ident}/tasks/{tid}"
+        data-nd-body='{{"status":"done"}}'
+        data-nd-success="reload">Done</button>"##,
+            ident = ident_attr,
+            tid = task_id_attr,
+        ),
+        "in_progress" => format!(
+            r##"<button class="nd-btn-secondary nd-btn-sm"
+        data-nd-action="PATCH /v1/projects/{ident}/tasks/{tid}"
+        data-nd-body='{{"status":"todo"}}'
+        data-nd-success="reload">Release</button>
+      <button class="nd-btn-primary nd-btn-sm"
+        data-nd-action="PATCH /v1/projects/{ident}/tasks/{tid}"
+        data-nd-body='{{"status":"done"}}'
+        data-nd-success="reload">Done</button>"##,
+            ident = ident_attr,
+            tid = task_id_attr,
+        ),
+        "done" => format!(
+            r##"<button class="nd-btn-secondary nd-btn-sm"
+        data-nd-action="PATCH /v1/projects/{ident}/tasks/{tid}"
+        data-nd-body='{{"status":"todo"}}'
+        data-nd-success="reload">Reopen</button>"##,
+            ident = ident_attr,
+            tid = task_id_attr,
+        ),
+        _ => String::new(),
+    };
+
+    // Comments — server-rendered in the order returned by get_task_detail.
+    let comment_count = detail.comments.len();
+    let comments_html = if detail.comments.is_empty() {
+        r#"<p class="nd-text-muted nd-text-sm">No comments yet.</p>"#.to_string()
+    } else {
+        detail
+            .comments
+            .iter()
+            .map(|c| {
+                format!(
+                    r#"<div class="nd-mb-md">
+      <div class="nd-text-muted nd-text-sm">{author} ({author_type}) · {created}</div>
+      <div>{content}</div>
+    </div>"#,
+                    author = he(&c.author),
+                    author_type = he(&c.author_type),
+                    created = he(&format_ts_ms(Some(c.created_at))),
+                    content = he(&c.content),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let page_title = format!("Task — {}", project.ident);
+
+    let content = format!(
+        r##"  <div class="nd-flex nd-gap-sm nd-mb-md">
+    <a class="nd-btn-ghost nd-btn-sm" href="/projects/{ident}/tasks">← Back to board</a>
+  </div>
+
+  <section class="nd-card nd-mb-lg">
+    <div class="nd-card-header nd-flex nd-flex-between">
+      <div>
+        <strong>{title}</strong>
+        <div class="nd-text-muted nd-text-sm">
+          status: {status} · rank {rank} · owner {owner} · reporter {reporter}
+        </div>
+      </div>
+      <div class="nd-flex nd-gap-sm">
+        {action_buttons}
+      </div>
+    </div>
+    <div class="nd-card-body">
+      <p class="nd-text-muted nd-text-sm">Description</p>
+      {description_block}
+      <p class="nd-text-muted nd-text-sm nd-mt-md">Details</p>
+      {details_block}
+    </div>
+  </section>
+
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>Comments ({comment_count})</strong></div>
+    <div class="nd-card-body">
+      {comments_html}
+
+      <form class="nd-mt-lg"
+            data-nd-action="POST /v1/projects/{ident}/tasks/{tid}/comments"
+            data-nd-success="reload,reset">
+        <div class="nd-form-group">
+          <label for="comment-content">Add a comment</label>
+          <textarea id="comment-content" name="content" rows="3" required></textarea>
+        </div>
+        <button type="submit" class="nd-btn-primary">Comment</button>
+      </form>
+    </div>
+  </section>"##,
+        ident = ident_attr,
+        tid = task_id_attr,
+        title = title,
+        status = status,
+        rank = task.rank,
+        owner = owner,
+        reporter = reporter,
+        action_buttons = action_buttons,
+        description_block = description_block,
+        details_block = details_block,
+        comment_count = comment_count,
+        comments_html = comments_html,
+    );
+
+    let html = format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
+        head = control_panel_head(&page_title, &theme),
+        open = control_panel_open(&page_title, "tasks"),
+        content = content,
+        close = control_panel_close(&state.api_key),
+    );
+    Ok(Html(html))
+}
+
 // ── ndesign partials (shared by dashboard + manage) ──────────────────────────
 
 const NDESIGN_BASE: &str = "https://storage.googleapis.com/ndesign-cdn/ndesign/latest";
