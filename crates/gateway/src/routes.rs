@@ -1667,6 +1667,7 @@ pub struct ListTasksQuery {
 pub struct CreateTaskRequest {
     pub title: String,
     pub description: Option<String>,
+    pub specification: Option<String>,
     pub details: Option<String>,
     pub labels: Option<Vec<String>>,
     pub hostname: Option<String>,
@@ -1684,6 +1685,7 @@ pub struct UpdateTaskRequest {
     pub rank: Option<i64>,
     pub title: Option<String>,
     pub description: Option<serde_json::Value>,
+    pub specification: Option<serde_json::Value>,
     pub details: Option<serde_json::Value>,
     pub labels: Option<Vec<String>>,
     pub hostname: Option<serde_json::Value>,
@@ -1707,8 +1709,43 @@ pub struct AddCommentRequest {
 pub struct TaskWithComments {
     #[serde(flatten)]
     pub task: db::Task,
+    pub specification: Option<String>,
     pub comments: Vec<db::TaskComment>,
     pub actions: Vec<TaskAction>,
+}
+
+impl TaskWithComments {
+    fn new(task: db::Task, comments: Vec<db::TaskComment>) -> Self {
+        let specification = task.details.clone();
+        let actions = actions_for_status(&task.status);
+        Self {
+            task,
+            specification,
+            comments,
+            actions,
+        }
+    }
+}
+
+const TASK_SPECIFICATION_HINT: &str = "If this is a complex task, make sure it has a proper specification so another agent can pick up the work if you drop it.";
+
+#[derive(Serialize)]
+pub struct TaskCreateResponse {
+    #[serde(flatten)]
+    pub task: db::Task,
+    pub specification: Option<String>,
+    pub hint: &'static str,
+}
+
+impl TaskCreateResponse {
+    fn new(task: db::Task) -> Self {
+        let specification = task.details.clone();
+        Self {
+            task,
+            specification,
+            hint: TASK_SPECIFICATION_HINT,
+        }
+    }
 }
 
 /// One status-transition button derived from the task's current status.
@@ -1869,7 +1906,7 @@ pub async fn create_task_handler(
     headers: HeaderMap,
     Path(ident): Path<String>,
     Json(req): Json<CreateTaskRequest>,
-) -> Result<Json<db::Task>> {
+) -> Result<Json<TaskCreateResponse>> {
     // Verify project exists.
     {
         let conn = state.db.lock().unwrap();
@@ -1891,7 +1928,7 @@ pub async fn create_task_handler(
 
     let reporter = resolve_identity(req.reporter, &headers);
     let description = req.description;
-    let details = req.details;
+    let specification = req.specification.or(req.details);
     let labels = req.labels.unwrap_or_default();
     let hostname = req.hostname;
 
@@ -1904,7 +1941,7 @@ pub async fn create_task_handler(
             &ident_clone,
             &title,
             description.as_deref(),
-            details.as_deref(),
+            specification.as_deref(),
             &labels,
             hostname.as_deref(),
             &reporter,
@@ -1912,7 +1949,7 @@ pub async fn create_task_handler(
     })
     .await??;
 
-    Ok(Json(task))
+    Ok(Json(TaskCreateResponse::new(task)))
 }
 
 pub async fn get_task_handler(
@@ -1931,14 +1968,7 @@ pub async fn get_task_handler(
     .await??;
 
     match detail {
-        Some(d) => {
-            let actions = actions_for_status(&d.task.status);
-            Ok(Json(TaskWithComments {
-                task: d.task,
-                comments: d.comments,
-                actions,
-            }))
-        }
+        Some(d) => Ok(Json(TaskWithComments::new(d.task, d.comments))),
         None => Err(AppError(
             StatusCode::NOT_FOUND,
             format!("task not found in project '{}'", ident),
@@ -1956,7 +1986,11 @@ pub async fn update_task_handler(
     // 400 on a client-side shape mistake rather than bubbling a 500.
     let owner_opt = decode_nullable_string("owner_agent_id", req.owner_agent_id)?;
     let description_opt = decode_nullable_string("description", req.description)?;
-    let details_opt = decode_nullable_string("details", req.details)?;
+    let details_opt = if req.specification.is_some() {
+        decode_nullable_string("specification", req.specification)?
+    } else {
+        decode_nullable_string("details", req.details)?
+    };
     let hostname_opt = decode_nullable_string("hostname", req.hostname)?;
 
     let actor = actor_agent_id(&headers);
@@ -2570,8 +2604,8 @@ pub async fn tasks_board(
     // dispatches `nd:refresh` on every bound panel inside the dialog. The
     // bound panels share the same URL so the runtime dedupes them into a
     // single HTTP fetch. `#task-modal-meta` MUST be in the refresh list —
-    // it is `data-nd-defer` and holds the description + details, so without
-    // the explicit refresh those fields stay blank on first open.
+    // it is `data-nd-defer` and holds the description + specification, so
+    // without the explicit refresh those fields stay blank on first open.
     let content = format!(
         r##"  <div class="nd-flex nd-gap-md nd-mb-md">
     <a class="nd-btn-ghost nd-btn-sm" href="/tasks">← All projects</a>
@@ -2662,8 +2696,8 @@ pub async fn tasks_board(
           <textarea id="new-description" name="description" rows="3"></textarea>
         </div>
         <div class="nd-form-group">
-          <label for="new-details">Details</label>
-          <textarea id="new-details" name="details" rows="6"></textarea>
+          <label for="new-specification">Specification</label>
+          <textarea id="new-specification" name="specification" rows="6"></textarea>
         </div>
       </div>
       <footer>
@@ -2700,8 +2734,8 @@ pub async fn tasks_board(
           </div>
           <p class="nd-text-muted nd-text-sm">Description</p>
           <p>{{{{description}}}}</p>
-          <p class="nd-text-muted nd-text-sm nd-mt-md">Details</p>
-          <pre class="nd-text-sm">{{{{details}}}}</pre>
+          <p class="nd-text-muted nd-text-sm nd-mt-md">Specification</p>
+          <pre class="nd-text-sm">{{{{specification}}}}</pre>
         </template>
       </div>
 
@@ -3292,8 +3326,8 @@ mod tests {
     ///   * store-var references render as `${selectedTaskId}`,
     ///   * the static PATCH action body is valid JSON,
     ///   * the card-click success refresh list includes `#task-modal-meta`
-    ///     (deferred panel — without this refresh description + details stay
-    ///     blank on first open),
+    ///     (deferred panel — without this refresh description + specification
+    ///     stays blank on first open),
     ///   * the kanban row does NOT carry `nd-gap-md` (stacks on the Bootstrap-
     ///     style gutter and wraps the third column),
     ///   * each column is a `<div class="nd-col-4">` wrapper with the card
@@ -3314,6 +3348,9 @@ mod tests {
   <div class="task-card-title">{{{{title}}}}</div>
   <ul class="task-card-meta"><li>{{{{comment_count}}}} comments</li></ul>
 </button>
+<label for="new-specification">Specification</label>
+<textarea id="new-specification" name="specification"></textarea>
+<pre>{{{{specification}}}}</pre>
 <div class="nd-row">
   <div class="nd-col-4">
     <section class="nd-card">
@@ -3344,7 +3381,7 @@ mod tests {
         );
         assert!(
             content.contains("refresh:#task-modal-meta"),
-            "card click must refresh #task-modal-meta (deferred description+details panel): {content}"
+            "card click must refresh #task-modal-meta (deferred description+specification panel): {content}"
         );
         assert!(
             !content.contains("nd-gap-md"),
@@ -3368,5 +3405,48 @@ mod tests {
                 .contains(r#"<ul class="task-card-meta"><li>{{comment_count}} comments</li></ul>"#),
             "task comment count must render as a bullet below the title: {content}"
         );
+        assert!(
+            content.contains(r#"name="specification""#)
+                && content.contains(r#"<pre>{{specification}}</pre>"#),
+            "task UI must use Specification naming for the long-form handoff field: {content}"
+        );
+    }
+
+    fn sample_task() -> db::Task {
+        db::Task {
+            id: "task-1".to_string(),
+            project_ident: "demo-project".to_string(),
+            title: "Demo task".to_string(),
+            description: Some("Short context".to_string()),
+            details: Some("Long handoff spec".to_string()),
+            status: "todo".to_string(),
+            rank: 1,
+            labels: vec!["demo".to_string()],
+            hostname: Some("host".to_string()),
+            owner_agent_id: None,
+            reporter: "agent".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            started_at: None,
+            done_at: None,
+        }
+    }
+
+    #[test]
+    fn task_create_response_includes_specification_alias_and_hint() {
+        let value = serde_json::to_value(TaskCreateResponse::new(sample_task())).unwrap();
+
+        assert_eq!(value["details"], "Long handoff spec");
+        assert_eq!(value["specification"], "Long handoff spec");
+        assert_eq!(value["hint"], TASK_SPECIFICATION_HINT);
+    }
+
+    #[test]
+    fn task_detail_response_includes_specification_alias() {
+        let value = serde_json::to_value(TaskWithComments::new(sample_task(), Vec::new())).unwrap();
+
+        assert_eq!(value["details"], "Long handoff spec");
+        assert_eq!(value["specification"], "Long handoff spec");
+        assert!(value["actions"].is_array());
     }
 }
