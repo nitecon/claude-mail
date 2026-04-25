@@ -189,7 +189,10 @@ All messaging endpoints accept an optional `X-Agent-Id` header. When provided, e
 |--------|------|-------------|
 | `PUT` | `/v1/skills/:name` | Upload or replace a skill (raw zip bytes, `Content-Type: application/zip`). |
 | `GET` | `/v1/skills` | List all skills. Returns `[{name, size, checksum, uploaded_at}]`. |
+| `POST` | `/v1/skills` | Create or update a markdown command/agent with JSON `{name, kind, content}`. Intended for the control-panel editor. |
+| `POST` | `/v1/skills/:name` | Create or update a markdown command/agent with JSON `{kind, content}`. |
 | `GET` | `/v1/skills/:name` | Download a skill as a zip file. |
+| `GET` | `/v1/skills/:name/content` | Fetch markdown content for a command/agent. |
 | `DELETE` | `/v1/skills/:name` | Delete a skill. |
 
 ### Patterns

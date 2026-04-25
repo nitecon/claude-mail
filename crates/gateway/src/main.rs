@@ -351,7 +351,10 @@ async fn main() -> Result<()> {
             "/v1/projects/{ident}/messages/{id}/action",
             post(routes::taking_action_on),
         )
-        .route("/v1/skills", get(routes::list_skills_handler))
+        .route(
+            "/v1/skills",
+            get(routes::list_skills_handler).post(routes::upsert_named_skill_json),
+        )
         .route(
             "/v1/skills/{name}",
             put(routes::upload_skill)
@@ -408,8 +411,13 @@ async fn main() -> Result<()> {
         .route("/patterns", get(routes::patterns_page))
         .route("/patterns/{id}", get(routes::pattern_detail_page))
         .route("/skills", get(routes::skills_page))
+        .route("/skills/{name}", get(routes::skill_detail_page))
         .route("/commands", get(routes::commands_page))
+        .route("/commands/new", get(routes::new_command_page))
+        .route("/commands/{name}", get(routes::command_detail_page))
         .route("/agents", get(routes::agents_page))
+        .route("/agents/new", get(routes::new_agent_page))
+        .route("/agents/{name}", get(routes::agent_detail_page))
         .route("/theme", get(routes::get_theme).post(routes::set_theme))
         .merge(api)
         .with_state(state);

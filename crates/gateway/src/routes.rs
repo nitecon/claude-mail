@@ -572,6 +572,79 @@ pub struct JsonSkillRequest {
     pub content: String,
 }
 
+#[derive(Deserialize)]
+pub struct NamedJsonSkillRequest {
+    pub name: String,
+    pub kind: String,
+    pub content: String,
+}
+
+async fn persist_text_skill(
+    state: AppState,
+    name: String,
+    kind: String,
+    content: String,
+) -> Result<Json<SkillUploadResponse>> {
+    use sha2::{Digest, Sha256};
+
+    if name.trim().is_empty() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "'name' must be non-empty".into(),
+        ));
+    }
+
+    let kind = match kind.as_str() {
+        "command" => "command".to_string(),
+        "agent" => "agent".to_string(),
+        other => {
+            return Err(AppError(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "invalid 'kind': '{other}' (must be 'command' or 'agent'; \
+                     zip skills use PUT /v1/skills/:name)"
+                ),
+            ))
+        }
+    };
+
+    if content.trim().is_empty() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "'content' must be non-empty".into(),
+        ));
+    }
+
+    let name = name.trim().to_string();
+    let size = content.len() as i64;
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    let checksum = hex::encode(hasher.finalize());
+
+    let record = db::SkillRecord {
+        name: name.clone(),
+        kind: kind.clone(),
+        zip_data: vec![],
+        content: Some(content),
+        size,
+        checksum: checksum.clone(),
+        uploaded_at: db::now_ms(),
+    };
+    let db = state.db.clone();
+    spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::upsert_skill(&conn, &record)
+    })
+    .await??;
+
+    Ok(Json(SkillUploadResponse {
+        name,
+        kind,
+        size,
+        checksum,
+    }))
+}
+
 /// Create-or-update a text-kind skill (`command` or `agent`) via JSON.
 ///
 /// ndesign's `data-nd-action` on a `<form>` serializes named inputs into a
@@ -593,63 +666,14 @@ pub async fn upsert_skill_json(
     Path(name): Path<String>,
     Json(req): Json<JsonSkillRequest>,
 ) -> Result<Json<SkillUploadResponse>> {
-    use sha2::{Digest, Sha256};
+    persist_text_skill(state, name, req.kind, req.content).await
+}
 
-    if name.trim().is_empty() {
-        return Err(AppError(
-            StatusCode::BAD_REQUEST,
-            "'name' must be non-empty".into(),
-        ));
-    }
-
-    let kind = match req.kind.as_str() {
-        "command" => "command".to_string(),
-        "agent" => "agent".to_string(),
-        other => {
-            return Err(AppError(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "invalid 'kind': '{other}' (must be 'command' or 'agent'; \
-                     zip skills use PUT /v1/skills/:name)"
-                ),
-            ))
-        }
-    };
-
-    if req.content.trim().is_empty() {
-        return Err(AppError(
-            StatusCode::BAD_REQUEST,
-            "'content' must be non-empty".into(),
-        ));
-    }
-
-    let size = req.content.len() as i64;
-    let mut hasher = Sha256::new();
-    hasher.update(req.content.as_bytes());
-    let checksum = hex::encode(hasher.finalize());
-
-    let record = db::SkillRecord {
-        name: name.clone(),
-        kind: kind.clone(),
-        zip_data: vec![],
-        content: Some(req.content),
-        size,
-        checksum: checksum.clone(),
-        uploaded_at: db::now_ms(),
-    };
-    let db = state.db.clone();
-    spawn_blocking(move || {
-        let conn = db.lock().unwrap();
-        db::upsert_skill(&conn, &record)
-    })
-    .await??;
-
-    Ok(Json(SkillUploadResponse {
-        name,
-        kind,
-        size,
-        checksum,
-    }))
+pub async fn upsert_named_skill_json(
+    State(state): State<AppState>,
+    Json(req): Json<NamedJsonSkillRequest>,
+) -> Result<Json<SkillUploadResponse>> {
+    persist_text_skill(state, req.name, req.kind, req.content).await
 }
 
 #[derive(Deserialize)]
@@ -786,8 +810,8 @@ pub async fn get_skill_content(
 /// Render one of the three admin list pages: skills, commands, or agents.
 ///
 /// `kind` must be `"skill"`, `"command"`, or `"agent"` and drives the API
-/// URLs, page labels, whether to show the create/edit affordances, and the
-/// row action (Download for zip skills, Edit modal for text kinds).
+/// URLs, page labels, whether to show the create affordance, and each row's
+/// full-page view/edit link.
 ///
 /// This is the shared body for `skills_page`, `commands_page`, and
 /// `agents_page`; each public handler is a thin wrapper that passes its kind
@@ -817,13 +841,12 @@ async fn render_kind_page(state: &AppState, kind: &str) -> Result<Html<String>> 
 
     let is_text_kind = kind == "command" || kind == "agent";
 
-    // Create button row — only for text kinds that can be authored in the UI.
     let create_row = if is_text_kind {
         format!(
             r##"  <div class="nd-flex nd-gap-md nd-mb-md">
-    <button class="nd-btn-primary nd-btn-sm" data-nd-modal="#create-modal">
+    <a class="nd-btn-primary nd-btn-sm" href="/{active}/new">
       + New {singular}
-    </button>
+    </a>
   </div>
 "##,
         )
@@ -831,76 +854,18 @@ async fn render_kind_page(state: &AppState, kind: &str) -> Result<Html<String>> 
         String::new()
     };
 
-    // Row action cell: Edit modal (text kinds) or a Download link (skills).
-    // NOTE: `data-nd-context` on the Edit button is a spec-risk placeholder —
-    // see the FIXME below near the edit modal.
     let row_action = if is_text_kind {
-        r##"<!-- FIXME: confirm data-nd-context is the correct attribute for
-                    row-to-modal context propagation; if the spec names it
-                    differently, the edit modal will open with {{name}}
-                    unresolved and we'll need ndesign support. -->
-                <button class="nd-btn-secondary nd-btn-sm"
-                      data-nd-modal="#edit-modal"
-                      data-nd-context>Edit</button>"##
-    } else {
-        r##"<a class="nd-btn-secondary nd-btn-sm"
-                 href="/v1/skills/{{name}}">Download</a>"##
-    };
-
-    // Create/Edit modals — only rendered for text kinds (no file upload in UI).
-    let modals = if is_text_kind {
         format!(
-            r##"
-<dialog id="create-modal" class="nd-modal">
-  <form data-nd-action="POST /v1/skills/{{{{name}}}}"
-        data-nd-success="close-modal,refresh:#list-body,reset">
-    <h3>New {singular}</h3>
-    <div class="nd-form-group">
-      <label for="create-name">Name</label>
-      <input id="create-name" name="name" required>
-    </div>
-    <div class="nd-form-group">
-      <label for="create-content">Content</label>
-      <textarea id="create-content" name="content" rows="12" required></textarea>
-    </div>
-    <input type="hidden" name="kind" value="{kind}">
-    <menu>
-      <button type="button" data-nd-dismiss class="nd-btn-ghost">Cancel</button>
-      <button type="submit" class="nd-btn-primary">Create</button>
-    </menu>
-  </form>
-</dialog>
-
-<dialog id="edit-modal" class="nd-modal">
-  <form data-nd-action="POST /v1/skills/{{{{name}}}}"
-        data-nd-success="close-modal,refresh:#list-body">
-    <h3>Edit {{{{name}}}}</h3>
-    <div class="nd-form-group">
-      <label for="edit-content">Content</label>
-      <!-- FIXME: confirm data-nd-bind-to-value binding works on textarea; if not, pre-fill is missing and we'll need ndesign support -->
-      <textarea id="edit-content" name="content" rows="12"
-                data-nd-bind="/v1/skills/{{{{name}}}}/content"
-                data-nd-value="content" required></textarea>
-    </div>
-    <input type="hidden" name="kind" value="{kind}">
-    <menu>
-      <button type="button" data-nd-dismiss class="nd-btn-ghost">Cancel</button>
-      <button type="submit" class="nd-btn-primary">Save</button>
-    </menu>
-  </form>
-</dialog>
-"##,
+            r##"<a class="nd-btn-secondary nd-btn-sm"
+                 href="/{active}/{{{{name}}}}">Edit</a>"##
         )
     } else {
-        String::new()
+        format!(
+            r##"<a class="nd-btn-secondary nd-btn-sm"
+                 href="/{active}/{{{{name}}}}">View</a>"##
+        )
     };
 
-    // NOTE: `data-nd-context` on the Edit button (interpolated above) is a
-    // spec-risk placeholder attribute meaning "when this modal opens, bind
-    // its form inputs to the clicked row's data so `{{name}}` resolves to
-    // that row". If ndesign's row-to-modal context propagation uses a
-    // different attribute name, the edit modal will open without the name
-    // resolved and we'll need to update this once the spec is confirmed.
     let content = format!(
         r##"{create_row}  <section class="nd-card">
     <div class="nd-card-header"><strong>{plural}</strong></div>
@@ -933,7 +898,7 @@ async fn render_kind_page(state: &AppState, kind: &str) -> Result<Html<String>> 
       </table>
     </div>
   </section>
-{modals}"##,
+"##,
         plural_lower = plural.to_lowercase(),
     );
 
@@ -964,6 +929,185 @@ pub async fn agents_page(State(state): State<AppState>) -> Result<Html<String>> 
     render_kind_page(&state, "agent").await
 }
 
+async fn render_skill_detail_page(
+    state: &AppState,
+    expected_kind: &str,
+    name: Option<String>,
+) -> Result<Html<String>> {
+    debug_assert!(
+        expected_kind == "skill" || expected_kind == "command" || expected_kind == "agent",
+        "render_skill_detail_page called with unsupported kind '{expected_kind}'"
+    );
+
+    let db = state.db.clone();
+    let lookup_name = name.clone();
+    let (theme, record) = spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = db.lock().unwrap();
+        let record = match lookup_name {
+            Some(name) => db::get_skill(&conn, &name)?,
+            None => None,
+        };
+        Ok((db::get_theme(&conn)?, record))
+    })
+    .await??;
+
+    let (singular, plural, active) = match expected_kind {
+        "skill" => ("Skill", "Skills", "skills"),
+        "command" => ("Command", "Commands", "commands"),
+        "agent" => ("Agent", "Agents", "agents"),
+        _ => ("Skill", "Skills", "skills"),
+    };
+
+    let is_new = name.is_none();
+    if expected_kind == "skill" && is_new {
+        return Err(AppError(
+            StatusCode::NOT_FOUND,
+            "skills are uploaded from the CLI".into(),
+        ));
+    }
+
+    let record = match (is_new, record) {
+        (true, _) => None,
+        (false, Some(record)) if record.kind == expected_kind => Some(record),
+        (false, Some(_)) | (false, None) => {
+            return Err(AppError(
+                StatusCode::NOT_FOUND,
+                format!("{} not found", singular.to_lowercase()),
+            ))
+        }
+    };
+
+    let title_name = name.as_deref().unwrap_or("New");
+    let page_title = if is_new {
+        format!("New {singular}")
+    } else {
+        format!("{singular}: {title_name}")
+    };
+
+    let content = if expected_kind == "skill" {
+        let record = record.expect("skill detail requires an existing record");
+        let download_path = path_segment(&record.name);
+        format!(
+            r#"  <div class="nd-flex nd-gap-md nd-mb-md">
+    <a class="nd-btn-secondary nd-btn-sm" href="/{active}">Back to {plural}</a>
+  </div>
+
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>{name}</strong></div>
+    <div class="nd-card-body">
+      <dl>
+        <dt>Kind</dt><dd>{kind}</dd>
+        <dt>Size</dt><dd>{size}</dd>
+        <dt>Checksum</dt><dd><code>{checksum}</code></dd>
+        <dt>Uploaded</dt><dd>{uploaded_at}</dd>
+      </dl>
+      <a class="nd-btn-primary" href="/v1/skills/{download_path}">Download</a>
+    </div>
+  </section>"#,
+            active = active,
+            plural = plural,
+            name = he(&record.name),
+            kind = he(&record.kind),
+            size = record.size,
+            checksum = he(&record.checksum),
+            uploaded_at = record.uploaded_at,
+            download_path = download_path,
+        )
+    } else {
+        let (form_action, name_input, content, submit_label) = match record {
+            Some(record) => (
+                format!("POST /v1/skills/{}", path_segment(&record.name)),
+                format!(
+                    r#"<input id="skill-edit-name" name="name" value="{}" disabled>"#,
+                    he(&record.name)
+                ),
+                record.content.unwrap_or_default(),
+                "Save",
+            ),
+            None => (
+                "POST /v1/skills".to_string(),
+                r#"<input id="skill-edit-name" name="name" required>"#.to_string(),
+                String::new(),
+                "Create",
+            ),
+        };
+
+        format!(
+            r#"  <div class="nd-flex nd-gap-md nd-mb-md">
+    <a class="nd-btn-secondary nd-btn-sm" href="/{active}">Back to {plural}</a>
+  </div>
+
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>{page_title}</strong></div>
+    <div class="nd-card-body">
+      <form data-nd-action="{form_action}">
+        <div class="nd-form-group">
+          <label for="skill-edit-name">Name</label>
+          {name_input}
+        </div>
+        <div class="nd-form-group">
+          <label for="skill-edit-content">Markdown</label>
+          <textarea id="skill-edit-content" name="content" rows="28" required>{content}</textarea>
+        </div>
+        <input type="hidden" name="kind" value="{kind}">
+        <div class="nd-flex nd-gap-sm">
+          <button type="submit" class="nd-btn-primary">{submit_label}</button>
+          <a class="nd-btn-secondary" href="/{active}">Done</a>
+        </div>
+      </form>
+    </div>
+  </section>"#,
+            active = active,
+            plural = plural,
+            page_title = he(&page_title),
+            form_action = he(&form_action),
+            name_input = name_input,
+            content = he(&content),
+            kind = expected_kind,
+            submit_label = submit_label,
+        )
+    };
+
+    let full_title = format!("agent-gateway — {page_title}");
+    let html = format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
+        head = control_panel_head(&full_title, &theme, ""),
+        open = control_panel_open(&page_title, active),
+        content = content,
+        close = control_panel_close(&state.api_key),
+    );
+    Ok(Html(html))
+}
+
+pub async fn skill_detail_page(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Html<String>> {
+    render_skill_detail_page(&state, "skill", Some(name)).await
+}
+
+pub async fn new_command_page(State(state): State<AppState>) -> Result<Html<String>> {
+    render_skill_detail_page(&state, "command", None).await
+}
+
+pub async fn command_detail_page(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Html<String>> {
+    render_skill_detail_page(&state, "command", Some(name)).await
+}
+
+pub async fn new_agent_page(State(state): State<AppState>) -> Result<Html<String>> {
+    render_skill_detail_page(&state, "agent", None).await
+}
+
+pub async fn agent_detail_page(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Html<String>> {
+    render_skill_detail_page(&state, "agent", Some(name)).await
+}
+
 // ── GET / (dashboard) ─────────────────────────────────────────────────────────
 
 fn he(s: &str) -> String {
@@ -971,6 +1115,18 @@ fn he(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+fn path_segment(s: &str) -> String {
+    let mut out = String::new();
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
@@ -2011,25 +2167,43 @@ pub async fn patterns_page(State(state): State<AppState>) -> Result<Html<String>
     })
     .await??;
 
+    let rows = if patterns.is_empty() {
+        r#"<tr><td colspan="5" class="nd-text-muted">No patterns yet.</td></tr>"#.to_string()
+    } else {
+        patterns
+            .iter()
+            .map(|p| {
+                let summary = p.summary.as_deref().unwrap_or("");
+                format!(
+                    r#"<tr>
+  <td>
+    <a class="nd-btn-ghost nd-text-left" href="/patterns/{id}">
+      <strong>{title}</strong>
+    </a>
+    <div class="nd-text-muted nd-text-sm">{summary}</div>
+  </td>
+  <td class="nd-text-muted">{slug}</td>
+  <td>{version}</td>
+  <td class="nd-text-muted">{state}</td>
+  <td>{comment_count}</td>
+</tr>"#,
+                    id = path_segment(&p.id),
+                    title = he(&p.title),
+                    summary = he(summary),
+                    slug = he(&p.slug),
+                    version = he(&p.version),
+                    state = he(&p.state),
+                    comment_count = p.comment_count,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
     let content = format!(
         r##"  <div class="nd-flex nd-gap-md nd-mb-md">
     <button class="nd-btn-primary nd-btn-sm" data-nd-modal="#new-pattern-modal">+ New pattern</button>
   </div>
-
-  <template id="pattern-row">
-    <tr>
-      <td>
-        <a class="nd-btn-ghost nd-text-left" href="/patterns/{{id}}">
-          <strong>{{title}}</strong>
-        </a>
-        <div class="nd-text-muted nd-text-sm">{{summary}}</div>
-      </td>
-      <td class="nd-text-muted">{{slug}}</td>
-      <td>{{version}}</td>
-      <td class="nd-text-muted">{{state}}</td>
-      <td>{{comment_count}}</td>
-    </tr>
-  </template>
 
   <section class="nd-card">
     <div class="nd-card-header"><strong>Patterns</strong></div>
@@ -2038,12 +2212,8 @@ pub async fn patterns_page(State(state): State<AppState>) -> Result<Html<String>
         <thead>
           <tr><th>Pattern</th><th>Slug</th><th>Version</th><th>State</th><th>Comments</th></tr>
         </thead>
-        <tbody id="patterns-list"
-               data-nd-bind="/v1/patterns"
-               data-nd-template="pattern-row">
-          <template data-nd-empty>
-            <tr><td colspan="5" class="nd-text-muted">No patterns yet.</td></tr>
-          </template>
+        <tbody id="patterns-list">
+          {rows}
         </tbody>
       </table>
     </div>
@@ -2101,6 +2271,7 @@ pub async fn patterns_page(State(state): State<AppState>) -> Result<Html<String>
   </dialog>
 
   {script}"##,
+        rows = rows,
         version_options = pattern_version_options("draft"),
         state_options = pattern_state_options("active"),
         superseded_options = pattern_superseded_by_options(&patterns, None, None),
