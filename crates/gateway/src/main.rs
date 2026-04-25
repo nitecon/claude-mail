@@ -406,6 +406,7 @@ async fn main() -> Result<()> {
         .route("/tasks", get(routes::tasks_picker))
         .route("/projects/{ident}/tasks", get(routes::tasks_board))
         .route("/patterns", get(routes::patterns_page))
+        .route("/patterns/{id}", get(routes::pattern_detail_page))
         .route("/skills", get(routes::skills_page))
         .route("/commands", get(routes::commands_page))
         .route("/agents", get(routes::agents_page))

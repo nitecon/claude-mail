@@ -33,11 +33,32 @@ pub async fn check_update(client: &reqwest::Client, current: &str) -> Result<Opt
     let latest = release.tag_name.trim_start_matches('v').to_string();
     let curr = current.trim_start_matches('v');
 
+    if !is_semverish(curr) {
+        return Ok(None);
+    }
+
     if is_newer(&latest, curr) {
         Ok(Some(release.tag_name))
     } else {
         Ok(None)
     }
+}
+
+fn is_semverish(version: &str) -> bool {
+    let mut parts = version.split('.');
+    let Some(major) = parts.next() else {
+        return false;
+    };
+    let Some(minor) = parts.next() else {
+        return false;
+    };
+    let Some(patch) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && [major, minor, patch]
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
 }
 
 /// Compare two semver-ish strings of the form `MAJOR.MINOR.PATCH`.
@@ -255,6 +276,16 @@ mod tests {
         assert!(is_newer("0.1.1", "0.1.0"));
         assert!(!is_newer("0.1.0", "0.1.0"));
         assert!(!is_newer("0.1.0", "0.2.0"));
+    }
+
+    #[test]
+    fn test_is_semverish_rejects_source_build_versions() {
+        assert!(is_semverish("1.0.2"));
+        assert!(is_semverish("0.10.0"));
+        assert!(!is_semverish("main-abcdef0"));
+        assert!(!is_semverish("source-abcdef0"));
+        assert!(!is_semverish("1.0"));
+        assert!(!is_semverish("1.0.2-dev"));
     }
 
     #[test]

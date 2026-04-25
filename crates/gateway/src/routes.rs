@@ -1908,13 +1908,9 @@ pub async fn patterns_page(State(state): State<AppState>) -> Result<Html<String>
   <template id="pattern-row">
     <tr>
       <td>
-        <button type="button"
-                class="nd-btn-ghost nd-text-left"
-                data-nd-set="selectedPatternId='{{id}}'"
-                data-nd-modal="#pattern-modal"
-                data-nd-success="refresh:#pattern-modal-title,refresh:#pattern-modal-meta,refresh:#pattern-modal-body,refresh:#pattern-modal-comments">
+        <a class="nd-btn-ghost nd-text-left" href="/patterns/{{id}}">
           <strong>{{title}}</strong>
-        </button>
+        </a>
         <div class="nd-text-muted nd-text-sm">{{summary}}</div>
       </td>
       <td class="nd-text-muted">{{slug}}</td>
@@ -1987,73 +1983,168 @@ pub async fn patterns_page(State(state): State<AppState>) -> Result<Html<String>
     </form>
   </dialog>
 
-  <dialog id="pattern-modal" class="nd-modal nd-modal-lg">
-    <header>
-      <h3 id="pattern-modal-title"
-          data-nd-bind="/v1/patterns/${selectedPatternId}"
-          data-nd-field="title"
-          data-nd-defer></h3>
-      <button type="button" class="nd-modal-close" data-nd-dismiss aria-label="Close">&times;</button>
-    </header>
-    <div>
-      <div id="pattern-modal-meta"
-           data-nd-bind="/v1/patterns/${selectedPatternId}"
-           data-nd-template="pattern-modal-meta-tmpl"
-           data-nd-defer>
-        <template id="pattern-modal-meta-tmpl">
-          <div class="nd-text-muted nd-text-sm nd-mb-md">
-            slug: {{slug}} · version {{version}} · state {{state}} · author {{author}}
-          </div>
-          <p>{{summary}}</p>
-        </template>
-      </div>
-
-      <pre id="pattern-modal-body"
-           class="nd-text-sm"
-           data-nd-bind="/v1/patterns/${selectedPatternId}"
-           data-nd-field="body"
-           data-nd-defer></pre>
-
-      <section class="nd-card nd-mt-lg">
-        <div class="nd-card-header"><strong>Comments</strong></div>
-        <div class="nd-card-body">
-          <div id="pattern-modal-comments"
-               data-nd-bind="/v1/patterns/${selectedPatternId}/comments"
-               data-nd-template="pattern-comment-tmpl"
-               data-nd-defer>
-            <template id="pattern-comment-tmpl">
-              <div class="nd-mb-md">
-                <div class="nd-text-muted nd-text-sm">{{author}} ({{author_type}})</div>
-                <div>{{content}}</div>
-              </div>
-            </template>
-            <template data-nd-empty>
-              <p class="nd-text-muted nd-text-sm">No comments yet.</p>
-            </template>
-          </div>
-
-          <form class="nd-mt-lg"
-                data-nd-action="POST /v1/patterns/${selectedPatternId}/comments"
-                data-nd-success="refresh:#pattern-modal-comments,refresh:#patterns-list,reset">
-            <div class="nd-form-group">
-              <label for="pattern-comment">Add a comment</label>
-              <textarea id="pattern-comment" name="content" rows="3" required></textarea>
-            </div>
-            <button type="submit" class="nd-btn-primary nd-btn-sm">Comment</button>
-          </form>
-        </div>
-      </section>
-    </div>
-  </dialog>"##;
+  "##;
 
     let html = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
-        head = control_panel_head(
-            "agent-gateway — Patterns",
-            &theme,
-            r#"<meta name="var:selectedPatternId" content="">"#,
-        ),
+        head = control_panel_head("agent-gateway — Patterns", &theme, "",),
         open = control_panel_open("Patterns", "patterns"),
+        content = content,
+        close = control_panel_close(&state.api_key),
+    );
+    Ok(Html(html))
+}
+
+// ── GET /patterns/:id (global pattern detail/editor) ─────────────────────────
+
+pub async fn pattern_detail_page(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Html<String>> {
+    let db = state.db.clone();
+    let id_for_lookup = id.clone();
+    let (pattern, theme) = spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = db.lock().unwrap();
+        Ok((
+            db::get_pattern(&conn, &id_for_lookup)?,
+            db::get_theme(&conn)?,
+        ))
+    })
+    .await??;
+
+    let pattern = pattern
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, format!("pattern '{}' not found", id)))?;
+
+    let version_option = |value: &str, label: &str| -> String {
+        if pattern.version == value {
+            format!(
+                r#"<option value="{}" selected>{}</option>"#,
+                he(value),
+                he(label)
+            )
+        } else {
+            format!(r#"<option value="{}">{}</option>"#, he(value), he(label))
+        }
+    };
+    let labels = pattern.labels.join(", ");
+    let summary = pattern.summary.as_deref().unwrap_or("");
+    let detail_title = format!("Pattern: {}", pattern.title);
+    let api_id = he(&pattern.id);
+
+    let content = format!(
+        r#"  <div class="nd-flex nd-gap-md nd-mb-md">
+    <a class="nd-btn-secondary nd-btn-sm" href="/patterns">Back to patterns</a>
+  </div>
+
+  <section class="nd-card">
+    <div class="nd-card-header">
+      <div>
+        <strong>{title}</strong>
+        <div id="pattern-detail-meta" class="nd-text-muted nd-text-sm">
+          slug: {slug} · version {version} · state {state} · author {author}
+        </div>
+      </div>
+    </div>
+    <div class="nd-card-body">
+      <form data-nd-action="PATCH /v1/patterns/{api_id}">
+        <div class="nd-row">
+          <div class="nd-col-6">
+            <div class="nd-form-group">
+              <label for="pattern-edit-title">Title</label>
+              <input id="pattern-edit-title" name="title" value="{title}" required>
+            </div>
+          </div>
+          <div class="nd-col-6">
+            <div class="nd-form-group">
+              <label for="pattern-edit-slug">Slug</label>
+              <input id="pattern-edit-slug" name="slug" value="{slug}" required>
+            </div>
+          </div>
+        </div>
+        <div class="nd-form-group">
+          <label for="pattern-edit-summary">Summary</label>
+          <textarea id="pattern-edit-summary" name="summary" rows="2">{summary}</textarea>
+        </div>
+        <div class="nd-form-group">
+          <label for="pattern-edit-labels">Labels</label>
+          <input id="pattern-edit-labels" name="labels" value="{labels}">
+        </div>
+        <div class="nd-row">
+          <div class="nd-col-6">
+            <div class="nd-form-group">
+              <label for="pattern-edit-version">Version</label>
+              <select id="pattern-edit-version" name="version" required>
+                {draft}
+                {latest}
+                {superseded}
+              </select>
+            </div>
+          </div>
+          <div class="nd-col-6">
+            <div class="nd-form-group">
+              <label for="pattern-edit-state">State</label>
+              <input id="pattern-edit-state" name="state" value="{state}" required>
+            </div>
+          </div>
+        </div>
+        <div class="nd-form-group">
+          <label for="pattern-edit-body">Markdown</label>
+          <textarea id="pattern-edit-body" name="body" rows="28" required>{body}</textarea>
+        </div>
+        <div class="nd-flex nd-gap-sm">
+          <button type="submit" class="nd-btn-primary">Save pattern</button>
+          <a class="nd-btn-secondary" href="/patterns">Done</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="nd-card nd-mt-lg">
+    <div class="nd-card-header"><strong>Comments</strong></div>
+    <div class="nd-card-body">
+      <div id="pattern-comments"
+           data-nd-bind="/v1/patterns/{api_id}/comments"
+           data-nd-template="pattern-comment-tmpl">
+        <template id="pattern-comment-tmpl">
+          <div class="nd-mb-md">
+            <div class="nd-text-muted nd-text-sm">{{{{author}}}} ({{{{author_type}}}})</div>
+            <div>{{{{content}}}}</div>
+          </div>
+        </template>
+        <template data-nd-empty>
+          <p class="nd-text-muted nd-text-sm">No comments yet.</p>
+        </template>
+      </div>
+
+      <form class="nd-mt-lg"
+            data-nd-action="POST /v1/patterns/{api_id}/comments"
+            data-nd-success="refresh:#pattern-comments,reset">
+        <div class="nd-form-group">
+          <label for="pattern-comment">Add a comment</label>
+          <textarea id="pattern-comment" name="content" rows="3" required></textarea>
+        </div>
+        <button type="submit" class="nd-btn-primary nd-btn-sm">Comment</button>
+      </form>
+    </div>
+  </section>"#,
+        api_id = api_id,
+        title = he(&pattern.title),
+        slug = he(&pattern.slug),
+        version = he(&pattern.version),
+        state = he(&pattern.state),
+        author = he(&pattern.author),
+        summary = he(summary),
+        labels = he(&labels),
+        body = he(&pattern.body),
+        draft = version_option("draft", "draft"),
+        latest = version_option("latest", "latest"),
+        superseded = version_option("superseded", "superseded"),
+    );
+
+    let html = format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
+        head = control_panel_head("agent-gateway — Pattern", &theme, ""),
+        open = control_panel_open(&detail_title, "patterns"),
         content = content,
         close = control_panel_close(&state.api_key),
     );

@@ -13,8 +13,10 @@
 #                   symlink to source-<sha>, retarget /opt/agentic/bin/gateway
 #                   at the active instance, restart the dev gateway,
 #                   health-check, roll back on failure.
-# On push of v*   : same but for prod. Restart is gated on
-#                   /etc/eventic/agent-gateway-prod-enabled.
+# On push of v*   : same but for prod. Restart of a dedicated prod unit is
+#                   gated on /etc/eventic/agent-gateway-prod-enabled. The
+#                   legacy single-service fallback restarts immediately because
+#                   its active binary pointer has already been moved.
 #
 # Service resolution: the script prefers the dedicated per-instance units
 # `gateway-dev.service` / `gateway-prod.service` if they exist, and falls
@@ -126,11 +128,17 @@ if [ "$SERVICE" = "gateway" ]; then
   echo "[eventic] ${BIN_ROOT}/gateway -> gateway-versions/${INSTANCE}/gateway (single-service mode)"
 fi
 
-# Prod gate: stage artifact but do not restart if gate file missing.
+# Prod gate: stage artifact but do not restart a dedicated prod unit if the
+# gate file is missing. In single-service mode the gateway symlink has already
+# been retargeted to the prod artifact, so restart it now to avoid serving a
+# stale in-memory binary while /opt/agentic/bin/gateway points elsewhere.
 if [ "$INSTANCE" = "prod" ] && [ ! -f "$GATE_FILE" ]; then
-  echo "[eventic] Prod artifact staged at ${INSTANCE_LINK} -> ${VERSION} but ${SERVICE} restart is GATED OFF"
-  echo "[eventic] Enable auto-restart on prod: sudo touch ${GATE_FILE}"
-  exit 0
+  if [ "$SERVICE" != "gateway" ]; then
+    echo "[eventic] Prod artifact staged at ${INSTANCE_LINK} -> ${VERSION} but ${SERVICE} restart is GATED OFF"
+    echo "[eventic] Enable auto-restart on prod: sudo touch ${GATE_FILE}"
+    exit 0
+  fi
+  echo "[eventic] Prod gate missing, but single-service mode uses ${SERVICE}; restarting selected binary"
 fi
 
 sudo systemctl enable "$SERVICE" 2>/dev/null || true
