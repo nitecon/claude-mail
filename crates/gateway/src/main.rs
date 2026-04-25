@@ -10,7 +10,7 @@ use axum::{
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{get, patch, post, put},
     Router,
 };
 use clap::{Parser, Subcommand};
@@ -108,6 +108,7 @@ fn spawn_inbound_processor(db: Db, mut rx: mpsc::Receiver<PluginEvent>) {
                     subject: None,
                     hostname: None,
                     event_at: None,
+                    deliver_to_agents: false,
                 };
                 db::insert_message(&conn, &m)?;
                 db::update_last_msg_id(&conn, &project.ident, &message.id)?;
@@ -372,6 +373,10 @@ async fn main() -> Result<()> {
             get(routes::list_tasks_handler).post(routes::create_task_handler),
         )
         .route(
+            "/v1/projects/{ident}/tasks/delegate",
+            post(routes::delegate_task_handler),
+        )
+        .route(
             "/v1/projects/{ident}/tasks/reorder",
             post(routes::reorder_tasks_handler),
         )
@@ -384,6 +389,10 @@ async fn main() -> Result<()> {
         .route(
             "/v1/projects/{ident}/tasks/{id}/comments",
             post(routes::add_comment_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/tasks/{id}/delegation",
+            patch(routes::update_delegation_handler),
         )
         .route(
             "/v1/patterns",

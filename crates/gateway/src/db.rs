@@ -20,7 +20,7 @@ pub struct Project {
 pub struct Message {
     pub id: i64,
     pub project_ident: String,
-    /// "agent" | "user"
+    /// "agent" | "user" | "system"
     pub source: String,
     /// Opaque, plugin-specific message identifier.
     pub external_message_id: Option<String>,
@@ -39,6 +39,8 @@ pub struct Message {
     /// Event time (epoch ms) supplied by the agent — distinct from sent_at,
     /// which is the gateway-receive time.
     pub event_at: Option<i64>,
+    /// System messages are only delivered to agents when explicitly enabled.
+    pub deliver_to_agents: bool,
 }
 
 pub fn open(path: &str) -> Result<Db> {
@@ -64,10 +66,11 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS messages (
             id                   INTEGER PRIMARY KEY AUTOINCREMENT,
             project_ident        TEXT NOT NULL REFERENCES projects(ident),
-            source               TEXT NOT NULL CHECK(source IN ('agent','user')),
+            source               TEXT NOT NULL CHECK(source IN ('agent','user','system')),
             external_message_id  TEXT,
             content              TEXT NOT NULL,
-            sent_at              INTEGER NOT NULL
+            sent_at              INTEGER NOT NULL,
+            deliver_to_agents    INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE INDEX IF NOT EXISTS idx_messages_project
@@ -153,6 +156,11 @@ fn apply_schema(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE messages ADD COLUMN subject TEXT", []);
     let _ = conn.execute("ALTER TABLE messages ADD COLUMN hostname TEXT", []);
     let _ = conn.execute("ALTER TABLE messages ADD COLUMN event_at INTEGER", []);
+    let _ = conn.execute(
+        "ALTER TABLE messages ADD COLUMN deliver_to_agents INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    migrate_messages_for_system_delivery(conn)?;
 
     // Migrate existing confirmed messages to agent_confirmations for "_default" agent.
     conn.execute(
@@ -189,7 +197,10 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             created_at      INTEGER NOT NULL,
             updated_at      INTEGER NOT NULL,
             started_at      INTEGER,
-            done_at         INTEGER
+            done_at         INTEGER,
+            kind            TEXT NOT NULL DEFAULT 'normal',
+            delegated_to_project_ident TEXT,
+            delegated_to_task_id TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_tasks_project_status
             ON tasks(project_ident, status);
@@ -206,6 +217,35 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_task_comments_task
             ON task_comments(task_id, created_at);",
+    )?;
+
+    let _ = conn.execute(
+        "ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'normal'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE tasks ADD COLUMN delegated_to_project_ident TEXT",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE tasks ADD COLUMN delegated_to_task_id TEXT", []);
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS task_delegations (
+            id                    TEXT PRIMARY KEY,
+            source_project_ident  TEXT NOT NULL REFERENCES projects(ident),
+            source_task_id        TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            target_project_ident  TEXT NOT NULL REFERENCES projects(ident),
+            target_task_id        TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            requester_agent_id    TEXT,
+            requester_hostname    TEXT,
+            created_at            INTEGER NOT NULL,
+            completed_at          INTEGER,
+            completion_message_id INTEGER REFERENCES messages(id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_task_delegations_source
+            ON task_delegations(source_project_ident, source_task_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_task_delegations_target
+            ON task_delegations(target_project_ident, target_task_id);",
     )?;
 
     // ── Patterns: global markdown pattern library ────────────────────────────
@@ -259,6 +299,74 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    Ok(())
+}
+
+fn migrate_messages_for_system_delivery(conn: &Connection) -> Result<()> {
+    let sql: Option<String> = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+        [],
+        |r| r.get(0),
+    )?;
+    let Some(sql) = sql else {
+        return Ok(());
+    };
+    if sql.contains("'system'") {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "PRAGMA foreign_keys=OFF;
+         ALTER TABLE agent_confirmations RENAME TO agent_confirmations_old;
+         ALTER TABLE messages RENAME TO messages_old;
+         CREATE TABLE messages (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_ident        TEXT NOT NULL REFERENCES projects(ident),
+            source               TEXT NOT NULL CHECK(source IN ('agent','user','system')),
+            external_message_id  TEXT,
+            content              TEXT NOT NULL,
+            sent_at              INTEGER NOT NULL,
+            confirmed_at         INTEGER,
+            parent_message_id    INTEGER,
+            agent_id             TEXT,
+            message_type         TEXT NOT NULL DEFAULT 'message',
+            subject              TEXT,
+            hostname             TEXT,
+            event_at             INTEGER,
+            deliver_to_agents    INTEGER NOT NULL DEFAULT 0
+         );
+         INSERT INTO messages (
+            id, project_ident, source, external_message_id, content, sent_at,
+            confirmed_at, parent_message_id, agent_id, message_type, subject,
+            hostname, event_at, deliver_to_agents
+         )
+         SELECT
+            id, project_ident, source, external_message_id, content, sent_at,
+            confirmed_at, parent_message_id, agent_id,
+            COALESCE(message_type, 'message'), subject, hostname, event_at, 0
+         FROM messages_old;
+         CREATE TABLE agent_confirmations (
+            agent_id       TEXT NOT NULL,
+            project_ident  TEXT NOT NULL,
+            message_id     INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            confirmed_at   INTEGER NOT NULL,
+            PRIMARY KEY (agent_id, project_ident, message_id)
+         );
+         INSERT OR IGNORE INTO agent_confirmations (
+            agent_id, project_ident, message_id, confirmed_at
+         )
+         SELECT agent_id, project_ident, message_id, confirmed_at
+         FROM agent_confirmations_old;
+         DROP TABLE agent_confirmations_old;
+         DROP TABLE messages_old;
+         CREATE INDEX IF NOT EXISTS idx_messages_project
+            ON messages(project_ident, id);
+         CREATE INDEX IF NOT EXISTS idx_messages_unconfirmed
+            ON messages(project_ident, id) WHERE confirmed_at IS NULL;
+         CREATE INDEX IF NOT EXISTS idx_agent_conf_project
+            ON agent_confirmations(project_ident, message_id);
+         PRAGMA foreign_keys=ON;",
+    )?;
     Ok(())
 }
 
@@ -368,14 +476,14 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
 // ── Messages ─────────────────────────────────────────────────────────────────
 
 pub fn insert_message(conn: &Connection, m: &Message) -> Result<i64> {
-    let confirmed_at = if m.source == "agent" {
+    let confirmed_at = if m.source == "agent" || (m.source == "system" && !m.deliver_to_agents) {
         Some(now_ms())
     } else {
         None
     };
     conn.execute(
-        "INSERT INTO messages (project_ident, source, external_message_id, content, sent_at, confirmed_at, parent_message_id, agent_id, message_type, subject, hostname, event_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        "INSERT INTO messages (project_ident, source, external_message_id, content, sent_at, confirmed_at, parent_message_id, agent_id, message_type, subject, hostname, event_at, deliver_to_agents)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             m.project_ident,
             m.source,
@@ -389,6 +497,7 @@ pub fn insert_message(conn: &Connection, m: &Message) -> Result<i64> {
             m.subject,
             m.hostname,
             m.event_at,
+            m.deliver_to_agents,
         ],
     )?;
     let msg_id = conn.last_insert_rowid();
@@ -427,10 +536,10 @@ pub fn get_unconfirmed_for_agent(
         "SELECT m.id, m.project_ident, m.source, m.external_message_id,
                 m.content, m.sent_at, m.confirmed_at,
                 m.parent_message_id, m.agent_id, m.message_type,
-                m.subject, m.hostname, m.event_at
+                m.subject, m.hostname, m.event_at, m.deliver_to_agents
          FROM messages m
          WHERE m.project_ident = ?1
-           AND m.source = 'user'
+           AND (m.source = 'user' OR m.deliver_to_agents = 1)
            AND NOT EXISTS (
                SELECT 1 FROM agent_confirmations ac
                WHERE ac.agent_id = ?2
@@ -468,7 +577,7 @@ pub fn get_message_by_id(
 ) -> Result<Option<Message>> {
     let mut stmt = conn.prepare_cached(
         "SELECT id, project_ident, source, external_message_id, content, sent_at, confirmed_at,
-                parent_message_id, agent_id, message_type, subject, hostname, event_at
+                parent_message_id, agent_id, message_type, subject, hostname, event_at, deliver_to_agents
          FROM messages
          WHERE id = ?1 AND project_ident = ?2",
     )?;
@@ -493,6 +602,7 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         subject: row.get(10)?,
         hostname: row.get(11)?,
         event_at: row.get(12)?,
+        deliver_to_agents: row.get(13)?,
     })
 }
 
@@ -768,6 +878,10 @@ pub struct Task {
     pub updated_at: i64,
     pub started_at: Option<i64>,
     pub done_at: Option<i64>,
+    /// "normal" | "delegated"
+    pub kind: String,
+    pub delegated_to_project_ident: Option<String>,
+    pub delegated_to_task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -779,6 +893,20 @@ pub struct TaskComment {
     pub author_type: String,
     pub content: String,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskDelegation {
+    pub id: String,
+    pub source_project_ident: String,
+    pub source_task_id: String,
+    pub target_project_ident: String,
+    pub target_task_id: String,
+    pub requester_agent_id: Option<String>,
+    pub requester_hostname: Option<String>,
+    pub created_at: i64,
+    pub completed_at: Option<i64>,
+    pub completion_message_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -794,6 +922,9 @@ pub struct TaskSummary {
     pub comment_count: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    pub kind: String,
+    pub delegated_to_project_ident: Option<String>,
+    pub delegated_to_task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1326,12 +1457,16 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         updated_at: row.get(12)?,
         started_at: row.get(13)?,
         done_at: row.get(14)?,
+        kind: row.get(15)?,
+        delegated_to_project_ident: row.get(16)?,
+        delegated_to_task_id: row.get(17)?,
     })
 }
 
 const TASK_SELECT_COLS: &str =
     "id, project_ident, title, description, details, status, rank, labels, \
-     hostname, owner_agent_id, reporter, created_at, updated_at, started_at, done_at";
+     hostname, owner_agent_id, reporter, created_at, updated_at, started_at, done_at, \
+     kind, delegated_to_project_ident, delegated_to_task_id";
 
 /// Reclaim any task in this project that has been `in_progress` for longer than
 /// [`TASK_RECLAIM_MS`] without any `updated_at` activity. Reclaimed tasks are
@@ -1415,8 +1550,9 @@ pub fn insert_task(
         "INSERT INTO tasks (
              id, project_ident, title, description, details, status, rank,
              labels, hostname, owner_agent_id, reporter,
-             created_at, updated_at, started_at, done_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, 'todo', ?6, ?7, ?8, NULL, ?9, ?10, ?10, NULL, NULL)",
+             created_at, updated_at, started_at, done_at, kind,
+             delegated_to_project_ident, delegated_to_task_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'todo', ?6, ?7, ?8, NULL, ?9, ?10, ?10, NULL, NULL, 'normal', NULL, NULL)",
         params![
             id,
             project_ident,
@@ -1447,7 +1583,46 @@ pub fn insert_task(
         updated_at: now,
         started_at: None,
         done_at: None,
+        kind: "normal".to_string(),
+        delegated_to_project_ident: None,
+        delegated_to_task_id: None,
     })
+}
+
+pub fn insert_delegated_task(
+    conn: &Connection,
+    project_ident: &str,
+    title: &str,
+    description: Option<&str>,
+    details: Option<&str>,
+    labels: &[String],
+    hostname: Option<&str>,
+    reporter: &str,
+    target_project_ident: &str,
+    target_task_id: &str,
+) -> Result<Task> {
+    let mut task = insert_task(
+        conn,
+        project_ident,
+        title,
+        description,
+        details,
+        labels,
+        hostname,
+        reporter,
+    )?;
+    conn.execute(
+        "UPDATE tasks
+         SET kind = 'delegated',
+             delegated_to_project_ident = ?1,
+             delegated_to_task_id = ?2
+         WHERE id = ?3 AND project_ident = ?4",
+        params![target_project_ident, target_task_id, task.id, project_ident],
+    )?;
+    task.kind = "delegated".to_string();
+    task.delegated_to_project_ident = Some(target_project_ident.to_string());
+    task.delegated_to_task_id = Some(target_task_id.to_string());
+    Ok(task)
 }
 
 /// List task summaries for a project filtered by status. When `statuses`
@@ -1482,7 +1657,8 @@ pub fn list_tasks(
             "SELECT t.id, t.title, t.status, t.rank, t.labels,
                     t.owner_agent_id, t.hostname, t.reporter,
                     (SELECT COUNT(*) FROM task_comments tc WHERE tc.task_id = t.id),
-                    t.created_at, t.updated_at
+                    t.created_at, t.updated_at, t.kind,
+                    t.delegated_to_project_ident, t.delegated_to_task_id
              FROM tasks t
              WHERE t.project_ident = ?1
                AND t.status IN ({in_clause})
@@ -1494,7 +1670,8 @@ pub fn list_tasks(
             "SELECT t.id, t.title, t.status, t.rank, t.labels,
                     t.owner_agent_id, t.hostname, t.reporter,
                     (SELECT COUNT(*) FROM task_comments tc WHERE tc.task_id = t.id),
-                    t.created_at, t.updated_at
+                    t.created_at, t.updated_at, t.kind,
+                    t.delegated_to_project_ident, t.delegated_to_task_id
              FROM tasks t
              WHERE t.project_ident = ?1
                AND t.status IN ({in_clause})
@@ -1528,6 +1705,9 @@ pub fn list_tasks(
                 comment_count: r.get(8)?,
                 created_at: r.get(9)?,
                 updated_at: r.get(10)?,
+                kind: r.get(11)?,
+                delegated_to_project_ident: r.get(12)?,
+                delegated_to_task_id: r.get(13)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1797,6 +1977,116 @@ pub fn insert_comment(
     })
 }
 
+fn row_to_delegation(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskDelegation> {
+    Ok(TaskDelegation {
+        id: row.get(0)?,
+        source_project_ident: row.get(1)?,
+        source_task_id: row.get(2)?,
+        target_project_ident: row.get(3)?,
+        target_task_id: row.get(4)?,
+        requester_agent_id: row.get(5)?,
+        requester_hostname: row.get(6)?,
+        created_at: row.get(7)?,
+        completed_at: row.get(8)?,
+        completion_message_id: row.get(9)?,
+    })
+}
+
+pub fn insert_task_delegation(
+    conn: &Connection,
+    source_project_ident: &str,
+    source_task_id: &str,
+    target_project_ident: &str,
+    target_task_id: &str,
+    requester_agent_id: Option<&str>,
+    requester_hostname: Option<&str>,
+) -> Result<TaskDelegation> {
+    let id = new_uuid();
+    let now = now_ms();
+    conn.execute(
+        "INSERT INTO task_delegations (
+            id, source_project_ident, source_task_id, target_project_ident,
+            target_task_id, requester_agent_id, requester_hostname, created_at,
+            completed_at, completion_message_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL)",
+        params![
+            id,
+            source_project_ident,
+            source_task_id,
+            target_project_ident,
+            target_task_id,
+            requester_agent_id,
+            requester_hostname,
+            now,
+        ],
+    )?;
+    Ok(TaskDelegation {
+        id,
+        source_project_ident: source_project_ident.to_string(),
+        source_task_id: source_task_id.to_string(),
+        target_project_ident: target_project_ident.to_string(),
+        target_task_id: target_task_id.to_string(),
+        requester_agent_id: requester_agent_id.map(str::to_string),
+        requester_hostname: requester_hostname.map(str::to_string),
+        created_at: now,
+        completed_at: None,
+        completion_message_id: None,
+    })
+}
+
+pub fn get_delegation_by_source(
+    conn: &Connection,
+    project_ident: &str,
+    task_id: &str,
+) -> Result<Option<TaskDelegation>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, source_project_ident, source_task_id, target_project_ident,
+                target_task_id, requester_agent_id, requester_hostname, created_at,
+                completed_at, completion_message_id
+         FROM task_delegations
+         WHERE source_project_ident = ?1 AND source_task_id = ?2",
+    )?;
+    let delegation = stmt
+        .query_map(params![project_ident, task_id], row_to_delegation)?
+        .next()
+        .transpose()?;
+    Ok(delegation)
+}
+
+pub fn get_delegation_by_target(
+    conn: &Connection,
+    project_ident: &str,
+    task_id: &str,
+) -> Result<Option<TaskDelegation>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, source_project_ident, source_task_id, target_project_ident,
+                target_task_id, requester_agent_id, requester_hostname, created_at,
+                completed_at, completion_message_id
+         FROM task_delegations
+         WHERE target_project_ident = ?1 AND target_task_id = ?2",
+    )?;
+    let delegation = stmt
+        .query_map(params![project_ident, task_id], row_to_delegation)?
+        .next()
+        .transpose()?;
+    Ok(delegation)
+}
+
+pub fn mark_delegation_complete(
+    conn: &Connection,
+    delegation_id: &str,
+    completion_message_id: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE task_delegations
+         SET completed_at = COALESCE(completed_at, ?1),
+             completion_message_id = COALESCE(completion_message_id, ?2)
+         WHERE id = ?3",
+        params![now_ms(), completion_message_id, delegation_id],
+    )?;
+    Ok(())
+}
+
 /// Delete a task (and its comments via ON DELETE CASCADE) scoped to a project.
 /// Returns true if a row was removed.
 pub fn delete_task(conn: &Connection, project_ident: &str, task_id: &str) -> Result<bool> {
@@ -1976,6 +2266,7 @@ mod tests {
             subject: None,
             hostname: None,
             event_at: None,
+            deliver_to_agents: source == "user",
         }
     }
 
@@ -2005,6 +2296,167 @@ mod tests {
         assert_eq!(unread[0].id, second_user);
         assert_eq!(unread[0].source, "user");
         assert_ne!(unread[0].id, agent_message);
+    }
+
+    #[test]
+    fn unconfirmed_for_agent_includes_deliverable_system_messages() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("proj")).unwrap();
+        upsert_agent(&conn, "proj", "agent-a").unwrap();
+
+        let hidden_system = insert_message(
+            &conn,
+            &Message {
+                deliver_to_agents: false,
+                source: "system".into(),
+                ..test_message("proj", "user", "internal bookkeeping", None)
+            },
+        )
+        .unwrap();
+        let delivered_system = insert_message(
+            &conn,
+            &Message {
+                deliver_to_agents: true,
+                source: "system".into(),
+                ..test_message("proj", "user", "delegated task created", None)
+            },
+        )
+        .unwrap();
+
+        let unread = get_unconfirmed_for_agent(&conn, "proj", "agent-a").unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].id, delivered_system);
+        assert_ne!(unread[0].id, hidden_system);
+    }
+
+    #[test]
+    fn schema_migration_preserves_confirmations_when_system_source_is_added() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE projects (
+                ident TEXT PRIMARY KEY,
+                channel_name TEXT NOT NULL,
+                room_id TEXT NOT NULL,
+                last_msg_id TEXT,
+                created_at INTEGER NOT NULL
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_ident TEXT NOT NULL REFERENCES projects(ident),
+                source TEXT NOT NULL CHECK(source IN ('agent','user')),
+                external_message_id TEXT,
+                content TEXT NOT NULL,
+                sent_at INTEGER NOT NULL,
+                confirmed_at INTEGER,
+                parent_message_id INTEGER,
+                agent_id TEXT,
+                message_type TEXT NOT NULL DEFAULT 'message',
+                subject TEXT,
+                hostname TEXT,
+                event_at INTEGER,
+                deliver_to_agents INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE agent_confirmations (
+                agent_id TEXT NOT NULL,
+                project_ident TEXT NOT NULL,
+                message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                confirmed_at INTEGER NOT NULL,
+                PRIMARY KEY (agent_id, project_ident, message_id)
+             );
+             INSERT INTO projects VALUES ('proj', 'test', 'room-proj', NULL, 1);
+             INSERT INTO messages (
+                id, project_ident, source, content, sent_at, confirmed_at
+             ) VALUES (1, 'proj', 'user', 'already read', 1, 1);
+             INSERT INTO agent_confirmations VALUES ('agent-a', 'proj', 1, 1);",
+        )
+        .unwrap();
+
+        apply_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO messages (project_ident, source, content, sent_at, deliver_to_agents)
+             VALUES ('proj', 'system', 'delegated', 2, 1)",
+            [],
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_confirmations
+                 WHERE message_id = 1 AND agent_id = 'agent-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let fk_errors: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk_errors, 0);
+    }
+
+    #[test]
+    fn task_delegation_links_source_and_target_tasks() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("source")).unwrap();
+        insert_project(&conn, &test_project("target")).unwrap();
+
+        let target = insert_task(
+            &conn,
+            "target",
+            "Build dependency",
+            Some("Context"),
+            Some("Specification"),
+            &[],
+            None,
+            "tester",
+        )
+        .unwrap();
+        let source = insert_delegated_task(
+            &conn,
+            "source",
+            "Build dependency (DELEGATED)",
+            Some("Context"),
+            Some("Specification"),
+            &[],
+            None,
+            "tester",
+            "target",
+            &target.id,
+        )
+        .unwrap();
+        let delegation = insert_task_delegation(
+            &conn,
+            "source",
+            &source.id,
+            "target",
+            &target.id,
+            Some("agent-a"),
+            Some("host-a"),
+        )
+        .unwrap();
+
+        assert_eq!(source.kind, "delegated");
+        assert_eq!(source.delegated_to_project_ident.as_deref(), Some("target"));
+        assert_eq!(
+            source.delegated_to_task_id.as_deref(),
+            Some(target.id.as_str())
+        );
+        assert_eq!(
+            get_delegation_by_source(&conn, "source", &source.id)
+                .unwrap()
+                .unwrap()
+                .id,
+            delegation.id
+        );
+        assert_eq!(
+            get_delegation_by_target(&conn, "target", &target.id)
+                .unwrap()
+                .unwrap()
+                .id,
+            delegation.id
+        );
     }
 
     #[test]
