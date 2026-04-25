@@ -1993,7 +1993,7 @@ pub async fn create_task_handler(
     let ident_clone = ident;
     let task = spawn_blocking(move || -> anyhow::Result<db::Task> {
         let conn = db.lock().unwrap();
-        db::insert_task(
+        let task = db::insert_task(
             &conn,
             &ident_clone,
             &title,
@@ -2002,7 +2002,19 @@ pub async fn create_task_handler(
             &labels,
             hostname.as_deref(),
             &reporter,
-        )
+        )?;
+        if task.owner_agent_id.is_none() && task.status == "todo" {
+            system_nudge(
+                &conn,
+                &ident_clone,
+                "Task created",
+                format!(
+                    "New task `{}` was created in project `{}`: {}\n\nFetch task `{}` to claim and execute it.",
+                    task.id, ident_clone, task.title, task.id
+                ),
+            )?;
+        }
+        Ok(task)
     })
     .await??;
 
@@ -2897,6 +2909,71 @@ pub async fn tasks_picker(State(state): State<AppState>) -> Result<Html<String>>
     Ok(Html(html))
 }
 
+pub async fn new_task_page(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+) -> Result<Html<String>> {
+    let db_handle = state.db.clone();
+    let ident_for_lookup = ident.clone();
+    let (project, theme) = spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = db_handle.lock().unwrap();
+        Ok((
+            db::get_project(&conn, &ident_for_lookup)?,
+            db::get_theme(&conn)?,
+        ))
+    })
+    .await??;
+
+    let project = project.ok_or_else(|| {
+        AppError(
+            StatusCode::NOT_FOUND,
+            format!("project '{}' not found", ident),
+        )
+    })?;
+
+    let ident_attr = he(&project.ident);
+    let page_title = format!("New task - {}", project.ident);
+    let content = format!(
+        r#"  <div class="nd-flex nd-gap-md nd-mb-md">
+    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/tasks">Back to board</a>
+  </div>
+
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>New task</strong></div>
+    <div class="nd-card-body">
+      <form data-nd-action="POST /v1/projects/{ident}/tasks">
+        <div class="nd-form-group">
+          <label for="new-task-title">Title</label>
+          <input id="new-task-title" name="title" required>
+        </div>
+        <div class="nd-form-group">
+          <label for="new-task-description">Description</label>
+          <textarea id="new-task-description" name="description" rows="5"></textarea>
+        </div>
+        <div class="nd-form-group">
+          <label for="new-task-specification">Specification</label>
+          <textarea id="new-task-specification" name="specification" rows="24"></textarea>
+        </div>
+        <div class="nd-flex nd-gap-sm">
+          <button type="submit" class="nd-btn-primary">Create task</button>
+          <a class="nd-btn-secondary" href="/projects/{ident}/tasks">Done</a>
+        </div>
+      </form>
+    </div>
+  </section>"#,
+        ident = ident_attr,
+    );
+
+    let html = format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
+        head = control_panel_head("agent-gateway - New task", &theme, ""),
+        open = control_panel_open(&page_title, "tasks"),
+        content = content,
+        close = control_panel_close(&state.api_key),
+    );
+    Ok(Html(html))
+}
+
 // ── GET /projects/:ident/tasks (board) ───────────────────────────────────────
 
 /// Render the three-column task board for a single project.
@@ -2956,7 +3033,7 @@ pub async fn tasks_board(
     let content = format!(
         r##"  <div class="nd-flex nd-gap-md nd-mb-md">
     <a class="nd-btn-ghost nd-btn-sm" href="/tasks">← All projects</a>
-    <button class="nd-btn-primary nd-btn-sm" data-nd-modal="#new-task-modal">+ New task</button>
+    <a class="nd-btn-primary nd-btn-sm" href="/projects/{ident}/tasks/new">+ New task</a>
   </div>
 
   <!-- Shared card template used by all three columns. -->
@@ -3027,32 +3104,6 @@ pub async fn tasks_board(
       </section>
     </div>
   </div>
-
-  <!-- New-task modal — unchanged pattern, posts and refreshes the TODO column. -->
-  <dialog id="new-task-modal" class="nd-modal">
-    <form data-nd-action="POST /v1/projects/{ident}/tasks"
-          data-nd-success="close-modal,refresh:#col-todo,reset">
-      <header><h3>New task</h3></header>
-      <div>
-        <div class="nd-form-group">
-          <label for="new-title">Title</label>
-          <input id="new-title" name="title" required>
-        </div>
-        <div class="nd-form-group">
-          <label for="new-description">Description</label>
-          <textarea id="new-description" name="description" rows="3"></textarea>
-        </div>
-        <div class="nd-form-group">
-          <label for="new-specification">Specification</label>
-          <textarea id="new-specification" name="specification" rows="6"></textarea>
-        </div>
-      </div>
-      <footer>
-        <button type="button" data-nd-dismiss class="nd-btn-ghost">Cancel</button>
-        <button type="submit" class="nd-btn-primary">Create</button>
-      </footer>
-    </form>
-  </dialog>
 
   <!--
     Task detail modal. The bound panels share the same URL so ndesign's
@@ -3705,6 +3756,7 @@ mod tests {
 </button>
 <label for="new-specification">Specification</label>
 <textarea id="new-specification" name="specification"></textarea>
+<a href="/projects/{ident}/tasks/new">+ New task</a>
 <pre>{{{{specification}}}}</pre>
 <div class="nd-row">
   <div class="nd-col-4">
@@ -3749,6 +3801,11 @@ mod tests {
         assert!(
             content.contains(r#"data-nd-sortable-group="tasks""#),
             "sortable columns must declare group=\"tasks\" for cross-column drag: {content}"
+        );
+        assert!(
+            content.contains(r#"href="/projects/demo-project/tasks/new""#)
+                && !content.contains("new-task-modal"),
+            "board must link to the dedicated new-task page instead of opening the old modal: {content}"
         );
         assert!(
             content.contains(r#"class="task-card-button""#)

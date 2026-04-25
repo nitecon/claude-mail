@@ -417,6 +417,7 @@ async fn main() -> Result<()> {
         .route("/", get(routes::dashboard))
         .route("/tasks", get(routes::tasks_picker))
         .route("/projects/{ident}/tasks", get(routes::tasks_board))
+        .route("/projects/{ident}/tasks/new", get(routes::new_task_page))
         .route("/patterns", get(routes::patterns_page))
         .route("/patterns/{id}", get(routes::pattern_detail_page))
         .route("/skills", get(routes::skills_page))
