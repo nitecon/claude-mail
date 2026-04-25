@@ -219,7 +219,9 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             labels      TEXT,
             version     TEXT NOT NULL DEFAULT 'draft'
                         CHECK(version IN ('draft','latest','superseded')),
-            state       TEXT NOT NULL DEFAULT 'active',
+            state       TEXT NOT NULL DEFAULT 'active'
+                        CHECK(state IN ('active','archived')),
+            superseded_by TEXT,
             author      TEXT NOT NULL,
             created_at  INTEGER NOT NULL,
             updated_at  INTEGER NOT NULL
@@ -247,6 +249,15 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         "ALTER TABLE patterns ADD COLUMN state TEXT NOT NULL DEFAULT 'active'",
         [],
     );
+    let _ = conn.execute("ALTER TABLE patterns ADD COLUMN superseded_by TEXT", []);
+    conn.execute(
+        "UPDATE patterns
+         SET superseded_by = substr(state, length('superseded-by:') + 1),
+             state = 'active'
+         WHERE superseded_by IS NULL
+           AND state LIKE 'superseded-by:%'",
+        [],
+    )?;
 
     Ok(())
 }
@@ -516,6 +527,14 @@ pub struct ProjectStats {
 }
 
 #[derive(serde::Serialize)]
+pub struct ProjectTaskStats {
+    pub ident: String,
+    pub todo_count: i64,
+    pub in_progress_count: i64,
+    pub done_count: i64,
+}
+
+#[derive(serde::Serialize)]
 pub struct DashboardData {
     pub project_count: i64,
     pub total_messages: i64,
@@ -552,6 +571,30 @@ pub fn list_project_stats(conn: &Connection) -> Result<Vec<ProjectStats>> {
                 room_id: r.get(2)?,
                 total_messages: r.get(3)?,
                 unread_count: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(projects)
+}
+
+pub fn list_project_task_stats(conn: &Connection) -> Result<Vec<ProjectTaskStats>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT p.ident,
+                COALESCE(SUM(CASE WHEN t.status = 'todo' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN t.status = 'in_progress' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END), 0)
+         FROM projects p
+         LEFT JOIN tasks t ON t.project_ident = p.ident
+         GROUP BY p.ident
+         ORDER BY p.created_at DESC",
+    )?;
+    let projects = stmt
+        .query_map([], |r| {
+            Ok(ProjectTaskStats {
+                ident: r.get(0)?,
+                todo_count: r.get(1)?,
+                in_progress_count: r.get(2)?,
+                done_count: r.get(3)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -803,6 +846,7 @@ pub struct Pattern {
     pub labels: Vec<String>,
     pub version: String,
     pub state: String,
+    pub superseded_by: Option<String>,
     pub author: String,
     pub created_at: i64,
     pub updated_at: i64,
@@ -817,6 +861,7 @@ pub struct PatternSummary {
     pub labels: Vec<String>,
     pub version: String,
     pub state: String,
+    pub superseded_by: Option<String>,
     pub author: String,
     pub comment_count: i64,
     pub created_at: i64,
@@ -844,6 +889,7 @@ pub struct PatternUpdate<'a> {
     pub labels: Option<&'a [String]>,
     pub version: Option<&'a str>,
     pub state: Option<&'a str>,
+    pub superseded_by: Option<Option<&'a str>>,
 }
 
 fn row_to_pattern(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pattern> {
@@ -856,20 +902,29 @@ fn row_to_pattern(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pattern> {
         labels: parse_labels(row.get::<_, Option<String>>(5)?),
         version: row.get(6)?,
         state: row.get(7)?,
-        author: row.get(8)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
+        superseded_by: row.get(8)?,
+        author: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
     })
 }
 
 const PATTERN_SELECT_COLS: &str =
-    "id, title, slug, summary, body, labels, version, state, author, created_at, updated_at";
+    "id, title, slug, summary, body, labels, version, state, superseded_by, author, created_at, updated_at";
 
 pub fn validate_pattern_version(version: &str) -> Result<()> {
     if version == "draft" || version == "latest" || version == "superseded" {
         Ok(())
     } else {
         anyhow::bail!("invalid pattern version '{version}': must be draft|latest|superseded");
+    }
+}
+
+pub fn validate_pattern_state(state: &str) -> Result<()> {
+    if state == "active" || state == "archived" {
+        Ok(())
+    } else {
+        anyhow::bail!("invalid pattern state '{state}': must be active|archived");
     }
 }
 
@@ -905,11 +960,18 @@ pub fn insert_pattern(
     labels: &[String],
     version: &str,
     state: &str,
+    superseded_by: Option<&str>,
     author: &str,
 ) -> Result<Pattern> {
     validate_pattern_version(version)?;
-    if state.trim().is_empty() {
-        anyhow::bail!("pattern state is required");
+    let state = state.trim();
+    validate_pattern_state(state)?;
+    let superseded_by = superseded_by.map(str::trim).filter(|s| !s.is_empty());
+    if version == "superseded" && superseded_by.is_none() {
+        anyhow::bail!("superseded_by is required when version is superseded");
+    }
+    if version != "superseded" && superseded_by.is_some() {
+        anyhow::bail!("superseded_by can only be set when version is superseded");
     }
 
     let id = new_uuid();
@@ -923,8 +985,8 @@ pub fn insert_pattern(
 
     conn.execute(
         "INSERT INTO patterns (
-             id, title, slug, summary, body, labels, version, state, author, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+             id, title, slug, summary, body, labels, version, state, superseded_by, author, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
         params![
             id,
             title,
@@ -933,7 +995,8 @@ pub fn insert_pattern(
             body,
             labels_json,
             version,
-            state.trim(),
+            state,
+            superseded_by,
             author,
             now,
         ],
@@ -947,7 +1010,8 @@ pub fn insert_pattern(
         body: body.to_string(),
         labels: labels.to_vec(),
         version: version.to_string(),
-        state: state.trim().to_string(),
+        state: state.to_string(),
+        superseded_by: superseded_by.map(str::to_string),
         author: author.to_string(),
         created_at: now,
         updated_at: now,
@@ -968,7 +1032,7 @@ pub fn list_patterns(
     filters: &PatternFilters<'_>,
 ) -> Result<Vec<PatternSummary>> {
     let mut sql = String::from(
-        "SELECT p.id, p.title, p.slug, p.summary, p.labels, p.version, p.state, p.author,
+        "SELECT p.id, p.title, p.slug, p.summary, p.labels, p.version, p.state, p.superseded_by, p.author,
                 (SELECT COUNT(*) FROM pattern_comments pc WHERE pc.pattern_id = p.id),
                 p.created_at, p.updated_at
          FROM patterns p",
@@ -986,7 +1050,8 @@ pub fn list_patterns(
               OR p.body LIKE ?{ph}
               OR COALESCE(p.labels, '') LIKE ?{ph}
               OR p.version LIKE ?{ph}
-              OR p.state LIKE ?{ph})"
+              OR p.state LIKE ?{ph}
+              OR COALESCE(p.superseded_by, '') LIKE ?{ph})"
         ));
     }
 
@@ -1002,6 +1067,7 @@ pub fn list_patterns(
     }
 
     if let Some(state) = filters.state.map(str::trim).filter(|v| !v.is_empty()) {
+        validate_pattern_state(state)?;
         binds.push(Box::new(state.to_string()));
         clauses.push(format!("p.state = ?{}", binds.len()));
     }
@@ -1011,8 +1077,9 @@ pub fn list_patterns(
         .map(str::trim)
         .filter(|v| !v.is_empty())
     {
-        binds.push(Box::new(format!("superseded-by:{target}")));
-        clauses.push(format!("p.state = ?{}", binds.len()));
+        binds.push(Box::new(target.to_string()));
+        let ph = binds.len();
+        clauses.push(format!("(p.superseded_by = ?{ph} OR p.superseded_by IN (SELECT id FROM patterns WHERE slug = ?{ph}))"));
     }
 
     if !clauses.is_empty() {
@@ -1031,10 +1098,11 @@ pub fn list_patterns(
             labels: parse_labels(r.get::<_, Option<String>>(4)?),
             version: r.get(5)?,
             state: r.get(6)?,
-            author: r.get(7)?,
-            comment_count: r.get(8)?,
-            created_at: r.get(9)?,
-            updated_at: r.get(10)?,
+            superseded_by: r.get(7)?,
+            author: r.get(8)?,
+            comment_count: r.get(9)?,
+            created_at: r.get(10)?,
+            updated_at: r.get(11)?,
         })
     };
 
@@ -1108,12 +1176,45 @@ pub fn update_pattern(
         );
     }
     if let Some(state) = upd.state {
-        if state.trim().is_empty() {
-            anyhow::bail!("pattern state is required");
-        }
+        validate_pattern_state(state.trim())?;
         push(
             "state",
             Box::new(state.trim().to_string()),
+            &mut sets,
+            &mut binds,
+        );
+    }
+    let next_version = upd.version.unwrap_or(&current.version);
+    let next_superseded_by = match upd.superseded_by {
+        Some(v) => v.map(str::trim).filter(|s| !s.is_empty()),
+        None => current.superseded_by.as_deref(),
+    };
+    if next_version == "superseded" && next_superseded_by.is_none() {
+        anyhow::bail!("superseded_by is required when version is superseded");
+    }
+    if next_version != "superseded"
+        && upd
+            .superseded_by
+            .and_then(|v| v.map(str::trim).filter(|s| !s.is_empty()))
+            .is_some()
+    {
+        anyhow::bail!("superseded_by can only be set when version is superseded");
+    }
+    if next_version != "superseded" && next_superseded_by.is_some() {
+        push(
+            "superseded_by",
+            Box::new(None::<String>),
+            &mut sets,
+            &mut binds,
+        );
+    } else if let Some(superseded_by) = upd.superseded_by {
+        let superseded_by = superseded_by
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        push(
+            "superseded_by",
+            Box::new(superseded_by),
             &mut sets,
             &mut binds,
         );
@@ -1861,6 +1962,7 @@ mod tests {
             &["eventic".into(), "deploy".into()],
             "draft",
             "active",
+            None,
             "tester",
         )
         .unwrap();
@@ -1894,6 +1996,7 @@ mod tests {
             &["security".into()],
             "latest",
             "active",
+            None,
             "tester",
         )
         .unwrap();
@@ -1933,7 +2036,8 @@ mod tests {
             "Do not use for new deployments.",
             &["linux".into(), "systemd".into(), "services".into()],
             "superseded",
-            "superseded-by:eventic-build-units",
+            "active",
+            Some("eventic-build-units"),
             "tester",
         )
         .unwrap();
@@ -1947,13 +2051,18 @@ mod tests {
             &[],
             "v1",
             "active",
+            None,
             "tester",
         )
         .is_err());
 
         let fetched = get_pattern(&conn, &old.slug).unwrap().unwrap();
         assert_eq!(fetched.version, "superseded");
-        assert_eq!(fetched.state, "superseded-by:eventic-build-units");
+        assert_eq!(fetched.state, "active");
+        assert_eq!(
+            fetched.superseded_by.as_deref(),
+            Some("eventic-build-units")
+        );
 
         let results = list_patterns(
             &conn,

@@ -197,12 +197,13 @@ All messaging endpoints accept an optional `X-Agent-Id` header. When provided, e
 Global markdown pattern library for organization-wide practices. Patterns are
 not project-scoped. They carry topical `labels` for search plus lifecycle
 metadata: `version` (`draft`, `latest`, or `superseded`) and required `state`
-(`active` or conventions such as `superseded-by:<id-or-slug>`).
+(`active` or `archived`). Superseded patterns can point at their replacement
+with `superseded_by`.
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/v1/patterns` | List pattern summaries. Supports `q`, `label`, `version`, `state`, and `superseded_by` query filters. |
-| `POST` | `/v1/patterns` | Create a pattern. Body includes `title`, `body`, `labels`, `version`, `state`, optional `slug`/`summary`/`author`. |
+| `POST` | `/v1/patterns` | Create a pattern. Body includes `title`, `body`, `labels`, `version`, `state`, optional `slug`/`summary`/`author`/`superseded_by`. |
 | `GET` | `/v1/patterns/:id` | Fetch one pattern by id or slug. Returns markdown and metadata, intentionally without comments. |
 | `PATCH` | `/v1/patterns/:id` | Update pattern metadata or markdown body. |
 | `DELETE` | `/v1/patterns/:id` | Delete a pattern and its comments. |

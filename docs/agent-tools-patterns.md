@@ -12,7 +12,7 @@ All endpoints require the same bearer token used by the existing gateway API.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/v1/patterns?q=<query>&label=<label>&version=<version>&state=<state>&superseded_by=<id-or-slug>` | List or search pattern summaries. Search covers title, slug, summary, body, labels, version, and state. Filters are exact-match and can be combined with `q`. |
+| `GET` | `/v1/patterns?q=<query>&label=<label>&version=<version>&state=<state>&superseded_by=<id-or-slug>` | List or search pattern summaries. Search covers title, slug, summary, body, labels, version, state, and `superseded_by`. Filters are exact-match and can be combined with `q`. |
 | `POST` | `/v1/patterns` | Create a pattern. |
 | `GET` | `/v1/patterns/:id` | Fetch one pattern by id or slug, without comments. |
 | `PATCH` | `/v1/patterns/:id` | Update pattern metadata or markdown body. |
@@ -31,6 +31,7 @@ Pattern create body:
   "labels": ["eventic", "deploy"],
   "version": "draft",
   "state": "active",
+  "superseded_by": null,
   "author": "agent-id"
 }
 ```
@@ -47,6 +48,7 @@ Pattern response shape:
   "labels": ["eventic", "deploy"],
   "version": "draft",
   "state": "active",
+  "superseded_by": null,
   "author": "agent-id",
   "created_at": 1777130000000,
   "updated_at": 1777130000000
@@ -62,9 +64,9 @@ include `comment_count`.
 - `latest`: current recommended practice.
 - `superseded`: retained for historical discovery but not recommended.
 
-`state` is required free-form lifecycle metadata. For active patterns use a
-short state such as `active`. For superseded patterns, use
-`superseded-by:<id-or-slug>` so agents can follow the replacement.
+`state` is required lifecycle metadata. Allowed values are `active` and
+`archived`. For superseded patterns, set `version` to `superseded` and
+`superseded_by` to the replacement pattern id or slug so agents can follow it.
 
 `labels` are topical tags used for search and filtering, such as `linux`,
 `systemd`, `services`, `eventic`, `deploy`, or `encryption`.
@@ -72,12 +74,12 @@ short state such as `active`. For superseded patterns, use
 Structured list filters:
 
 - `q`: broad text search across title, slug, summary, body, labels, version,
-  and state.
+  state, and `superseded_by`.
 - `label`: exact topical tag match, for example `label=systemd`.
 - `version`: exact lifecycle match; must be `draft`, `latest`, or
   `superseded`.
-- `state`: exact state match, for example `state=active`.
-- `superseded_by`: convenience filter for `state=superseded-by:<id-or-slug>`.
+- `state`: exact state match; must be `active` or `archived`.
+- `superseded_by`: exact replacement pointer match by id or slug.
 
 Comments are intentionally not included in `GET /v1/patterns/:id`. Agents should
 only fetch comments when the user explicitly asks to address or review comments.
@@ -90,8 +92,8 @@ Recommended commands:
 agent-tools patterns list
 agent-tools patterns search "<query>" [--label x] [--version latest] [--state active] [--superseded-by slug]
 agent-tools patterns get <id-or-slug>
-agent-tools patterns create --title "..." --version draft --state active [--slug "..."] [--label x] [--summary "..."] --body-file path.md
-agent-tools patterns update <id-or-slug> [--title "..."] [--version latest] [--state "superseded-by:..."] [--slug "..."] [--label x] [--summary "..."] [--body-file path.md]
+agent-tools patterns create --title "..." --version draft --state active [--superseded-by id-or-slug when superseded] [--slug "..."] [--label x] [--summary "..."] --body-file path.md
+agent-tools patterns update <id-or-slug> [--title "..."] [--version latest] [--state active|archived] [--superseded-by id-or-slug] [--slug "..."] [--label x] [--summary "..."] [--body-file path.md]
 agent-tools patterns delete <id-or-slug>
 agent-tools patterns comments <id-or-slug>
 agent-tools patterns comment <id-or-slug> "<markdown comment>"
@@ -130,7 +132,7 @@ frontend conventions, release workflows, or incident response.
 
 When multiple matching patterns exist, agents should prefer `version=latest`.
 If an otherwise relevant pattern has `version=superseded`, agents should inspect
-`state` for a `superseded-by:<id-or-slug>` pointer and fetch that replacement.
+`superseded_by` and fetch that replacement.
 Draft patterns can inform discussion, but should not override latest patterns
 unless the user explicitly asks to work on draft guidance.
 

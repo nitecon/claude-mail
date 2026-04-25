@@ -1085,6 +1085,7 @@ pub struct CreatePatternRequest {
     pub labels: Option<serde_json::Value>,
     pub version: String,
     pub state: String,
+    pub superseded_by: Option<String>,
     /// Defaults to X-Agent-Id header, or "user" when the header is absent.
     pub author: Option<String>,
 }
@@ -1099,6 +1100,7 @@ pub struct UpdatePatternRequest {
     pub labels: Option<serde_json::Value>,
     pub version: Option<String>,
     pub state: Option<String>,
+    pub superseded_by: Option<serde_json::Value>,
 }
 
 fn validate_pattern_version_field(version: &str) -> Result<()> {
@@ -1108,6 +1110,17 @@ fn validate_pattern_version_field(version: &str) -> Result<()> {
         Err(AppError(
             StatusCode::BAD_REQUEST,
             format!("invalid version '{version}': must be draft|latest|superseded"),
+        ))
+    }
+}
+
+fn validate_pattern_state_field(state: &str) -> Result<()> {
+    if state == "active" || state == "archived" {
+        Ok(())
+    } else {
+        Err(AppError(
+            StatusCode::BAD_REQUEST,
+            format!("invalid state '{state}': must be active|archived"),
         ))
     }
 }
@@ -1159,6 +1172,9 @@ pub async fn list_patterns_handler(
     if let Some(version) = q.version.as_deref() {
         validate_pattern_version_field(version.trim())?;
     }
+    if let Some(state) = q.state.as_deref() {
+        validate_pattern_state_field(state.trim())?;
+    }
     let db = state.db.clone();
     let query = q.q;
     let label = q.label;
@@ -1195,10 +1211,22 @@ pub async fn create_pattern_handler(
         return Err(AppError(StatusCode::BAD_REQUEST, "body is required".into()));
     }
     validate_pattern_version_field(req.version.trim())?;
-    if req.state.trim().is_empty() {
+    validate_pattern_state_field(req.state.trim())?;
+    let superseded_by = req
+        .superseded_by
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if req.version.trim() == "superseded" && superseded_by.is_none() {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "state is required".into(),
+            "superseded_by is required when version is superseded".into(),
+        ));
+    }
+    if req.version.trim() != "superseded" && superseded_by.is_some() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "superseded_by can only be set when version is superseded".into(),
         ));
     }
 
@@ -1211,6 +1239,7 @@ pub async fn create_pattern_handler(
     let body = req.body;
     let version = req.version;
     let state_value = req.state;
+    let superseded_by = req.superseded_by;
 
     let pattern = spawn_blocking(move || {
         let conn = db.lock().unwrap();
@@ -1223,6 +1252,7 @@ pub async fn create_pattern_handler(
             &labels,
             version.trim(),
             state_value.trim(),
+            superseded_by.as_deref().map(str::trim),
             &author,
         )
     })
@@ -1258,16 +1288,12 @@ pub async fn update_pattern_handler(
 ) -> Result<Json<db::Pattern>> {
     let summary = decode_nullable_string("summary", req.summary)?;
     let labels = decode_optional_labels_field("labels", req.labels)?;
+    let superseded_by = decode_nullable_string("superseded_by", req.superseded_by)?;
     if let Some(version) = req.version.as_deref() {
         validate_pattern_version_field(version.trim())?;
     }
     if let Some(state) = req.state.as_deref() {
-        if state.trim().is_empty() {
-            return Err(AppError(
-                StatusCode::BAD_REQUEST,
-                "state cannot be empty".into(),
-            ));
-        }
+        validate_pattern_state_field(state.trim())?;
     }
     let db = state.db.clone();
     let id_for_update = id.clone();
@@ -1287,6 +1313,7 @@ pub async fn update_pattern_handler(
             labels: labels.as_deref(),
             version: version.as_deref().map(str::trim),
             state: state_value.as_deref().map(str::trim),
+            superseded_by: superseded_by.as_ref().map(|inner| inner.as_deref()),
         };
         db::update_pattern(&conn, &id_for_update, &upd)
     })
@@ -1387,6 +1414,86 @@ pub async fn add_pattern_comment_handler(
             format!("pattern '{}' not found", id),
         )),
     }
+}
+
+fn pattern_version_options(selected: &str) -> String {
+    ["draft", "latest", "superseded"]
+        .iter()
+        .map(|value| {
+            if *value == selected {
+                format!(r#"<option value="{value}" selected>{value}</option>"#)
+            } else {
+                format!(r#"<option value="{value}">{value}</option>"#)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn pattern_state_options(selected: &str) -> String {
+    ["active", "archived"]
+        .iter()
+        .map(|value| {
+            if *value == selected {
+                format!(r#"<option value="{value}" selected>{value}</option>"#)
+            } else {
+                format!(r#"<option value="{value}">{value}</option>"#)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn pattern_superseded_by_options(
+    patterns: &[db::PatternSummary],
+    selected: Option<&str>,
+    exclude_id: Option<&str>,
+) -> String {
+    let mut options = vec![r#"<option value="">Select replacement pattern</option>"#.to_string()];
+    options.extend(
+        patterns
+            .iter()
+            .filter(|p| exclude_id != Some(p.id.as_str()))
+            .map(|p| {
+                let selected_attr = if selected.map(|s| s == p.id || s == p.slug).unwrap_or(false) {
+                    " selected"
+                } else {
+                    ""
+                };
+                let label = format!("{} ({})", p.title, p.slug);
+                format!(
+                    r#"<option value="{}"{}>{}</option>"#,
+                    he(&p.id),
+                    selected_attr,
+                    he(&label)
+                )
+            }),
+    );
+    options.join("\n")
+}
+
+fn pattern_superseded_select_script() -> &'static str {
+    r#"<script>
+(() => {
+  const syncPatternSupersededControls = () => {
+    document.querySelectorAll('[data-pattern-version-select]').forEach((version) => {
+      const form = version.closest('form');
+      const select = form && form.querySelector('[data-pattern-superseded-select]');
+      if (!select) return;
+      const enabled = version.value === 'superseded';
+      select.disabled = !enabled;
+      select.required = enabled;
+      if (!enabled) select.value = '';
+    });
+  };
+  document.addEventListener('change', (event) => {
+    if (event.target && event.target.matches('[data-pattern-version-select]')) {
+      syncPatternSupersededControls();
+    }
+  });
+  syncPatternSupersededControls();
+})();
+</script>"#
 }
 
 // ── Tasks API ────────────────────────────────────────────────────────────────
@@ -1895,13 +2002,17 @@ pub async fn list_projects_handler(
 
 pub async fn patterns_page(State(state): State<AppState>) -> Result<Html<String>> {
     let db = state.db.clone();
-    let theme = spawn_blocking(move || {
+    let (theme, patterns) = spawn_blocking(move || -> anyhow::Result<_> {
         let conn = db.lock().unwrap();
-        db::get_theme(&conn)
+        Ok((
+            db::get_theme(&conn)?,
+            db::list_patterns(&conn, &db::PatternFilters::default())?,
+        ))
     })
     .await??;
 
-    let content = r##"  <div class="nd-flex nd-gap-md nd-mb-md">
+    let content = format!(
+        r##"  <div class="nd-flex nd-gap-md nd-mb-md">
     <button class="nd-btn-primary nd-btn-sm" data-nd-modal="#new-pattern-modal">+ New pattern</button>
   </div>
 
@@ -1961,15 +2072,21 @@ pub async fn patterns_page(State(state): State<AppState>) -> Result<Html<String>
         </div>
         <div class="nd-form-group">
           <label for="pattern-version">Version</label>
-          <select id="pattern-version" name="version" required>
-            <option value="draft" selected>draft</option>
-            <option value="latest">latest</option>
-            <option value="superseded">superseded</option>
+          <select id="pattern-version" name="version" data-pattern-version-select required>
+            {version_options}
           </select>
         </div>
         <div class="nd-form-group">
           <label for="pattern-state">State</label>
-          <input id="pattern-state" name="state" value="active" required>
+          <select id="pattern-state" name="state" required>
+            {state_options}
+          </select>
+        </div>
+        <div class="nd-form-group">
+          <label for="pattern-superseded-by">Superseded by</label>
+          <select id="pattern-superseded-by" name="superseded_by" data-pattern-superseded-select disabled>
+            {superseded_options}
+          </select>
         </div>
         <div class="nd-form-group">
           <label for="pattern-body">Markdown</label>
@@ -1983,7 +2100,12 @@ pub async fn patterns_page(State(state): State<AppState>) -> Result<Html<String>
     </form>
   </dialog>
 
-  "##;
+  {script}"##,
+        version_options = pattern_version_options("draft"),
+        state_options = pattern_state_options("active"),
+        superseded_options = pattern_superseded_by_options(&patterns, None, None),
+        script = pattern_superseded_select_script(),
+    );
 
     let html = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
@@ -2003,11 +2125,12 @@ pub async fn pattern_detail_page(
 ) -> Result<Html<String>> {
     let db = state.db.clone();
     let id_for_lookup = id.clone();
-    let (pattern, theme) = spawn_blocking(move || -> anyhow::Result<_> {
+    let (pattern, theme, patterns) = spawn_blocking(move || -> anyhow::Result<_> {
         let conn = db.lock().unwrap();
         Ok((
             db::get_pattern(&conn, &id_for_lookup)?,
             db::get_theme(&conn)?,
+            db::list_patterns(&conn, &db::PatternFilters::default())?,
         ))
     })
     .await??;
@@ -2015,21 +2138,15 @@ pub async fn pattern_detail_page(
     let pattern = pattern
         .ok_or_else(|| AppError(StatusCode::NOT_FOUND, format!("pattern '{}' not found", id)))?;
 
-    let version_option = |value: &str, label: &str| -> String {
-        if pattern.version == value {
-            format!(
-                r#"<option value="{}" selected>{}</option>"#,
-                he(value),
-                he(label)
-            )
-        } else {
-            format!(r#"<option value="{}">{}</option>"#, he(value), he(label))
-        }
-    };
     let labels = pattern.labels.join(", ");
     let summary = pattern.summary.as_deref().unwrap_or("");
     let detail_title = format!("Pattern: {}", pattern.title);
     let api_id = he(&pattern.id);
+    let superseded_meta = pattern
+        .superseded_by
+        .as_deref()
+        .map(|target| format!(" · superseded by {}", he(target)))
+        .unwrap_or_default();
 
     let content = format!(
         r#"  <div class="nd-flex nd-gap-md nd-mb-md">
@@ -2041,7 +2158,7 @@ pub async fn pattern_detail_page(
       <div>
         <strong>{title}</strong>
         <div id="pattern-detail-meta" class="nd-text-muted nd-text-sm">
-          slug: {slug} · version {version} · state {state} · author {author}
+          slug: {slug} · version {version} · state {state}{superseded_meta} · author {author}
         </div>
       </div>
     </div>
@@ -2073,19 +2190,25 @@ pub async fn pattern_detail_page(
           <div class="nd-col-6">
             <div class="nd-form-group">
               <label for="pattern-edit-version">Version</label>
-              <select id="pattern-edit-version" name="version" required>
-                {draft}
-                {latest}
-                {superseded}
+              <select id="pattern-edit-version" name="version" data-pattern-version-select required>
+                {version_options}
               </select>
             </div>
           </div>
           <div class="nd-col-6">
             <div class="nd-form-group">
               <label for="pattern-edit-state">State</label>
-              <input id="pattern-edit-state" name="state" value="{state}" required>
+              <select id="pattern-edit-state" name="state" required>
+                {state_options}
+              </select>
             </div>
           </div>
+        </div>
+        <div class="nd-form-group">
+          <label for="pattern-edit-superseded-by">Superseded by</label>
+          <select id="pattern-edit-superseded-by" name="superseded_by" data-pattern-superseded-select>
+            {superseded_options}
+          </select>
         </div>
         <div class="nd-form-group">
           <label for="pattern-edit-body">Markdown</label>
@@ -2126,19 +2249,27 @@ pub async fn pattern_detail_page(
         <button type="submit" class="nd-btn-primary nd-btn-sm">Comment</button>
       </form>
     </div>
-  </section>"#,
+  </section>
+
+  {script}"#,
         api_id = api_id,
         title = he(&pattern.title),
         slug = he(&pattern.slug),
         version = he(&pattern.version),
         state = he(&pattern.state),
+        superseded_meta = superseded_meta,
         author = he(&pattern.author),
         summary = he(summary),
         labels = he(&labels),
         body = he(&pattern.body),
-        draft = version_option("draft", "draft"),
-        latest = version_option("latest", "latest"),
-        superseded = version_option("superseded", "superseded"),
+        version_options = pattern_version_options(&pattern.version),
+        state_options = pattern_state_options(&pattern.state),
+        superseded_options = pattern_superseded_by_options(
+            &patterns,
+            pattern.superseded_by.as_deref(),
+            Some(&pattern.id),
+        ),
+        script = pattern_superseded_select_script(),
     );
 
     let html = format!(
@@ -2153,47 +2284,56 @@ pub async fn pattern_detail_page(
 
 // ── GET /tasks (project picker) ──────────────────────────────────────────────
 
-/// Render the project picker — a small table that the ndesign runtime
-/// hydrates from `GET /v1/projects`. The authenticated XHR is carried by the
-/// `Authorization` header emitted by `NDesign.configure` in
-/// `control_panel_close`.
+/// Render the project picker with task counts so `/tasks` stays focused on
+/// task-board navigation rather than dashboard message metadata.
 pub async fn tasks_picker(State(state): State<AppState>) -> Result<Html<String>> {
     let db = state.db.clone();
-    let theme = spawn_blocking(move || {
+    let (theme, projects) = spawn_blocking(move || -> anyhow::Result<_> {
         let conn = db.lock().unwrap();
-        db::get_theme(&conn)
+        Ok((db::get_theme(&conn)?, db::list_project_task_stats(&conn)?))
     })
     .await??;
 
-    let content = r##"  <section class="nd-card">
+    let rows = if projects.is_empty() {
+        r#"<tr><td colspan="4" class="nd-text-muted">No projects registered yet.</td></tr>"#
+            .to_string()
+    } else {
+        projects
+            .iter()
+            .map(|p| {
+                format!(
+                    r#"<tr>
+  <td><a class="nd-btn-ghost nd-text-left" href="/projects/{ident}/tasks"><strong>{ident}</strong></a></td>
+  <td>{todo}</td>
+  <td>{in_progress}</td>
+  <td>{done}</td>
+</tr>"#,
+                    ident = he(&p.ident),
+                    todo = p.todo_count,
+                    in_progress = p.in_progress_count,
+                    done = p.done_count,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let content = format!(
+        r##"  <section class="nd-card">
     <div class="nd-card-header"><strong>Projects</strong></div>
     <div class="nd-card-body nd-p-0">
       <table class="nd-table nd-table-hover">
         <thead>
-          <tr><th>Project</th><th>Channel</th><th>Messages</th><th></th></tr>
+          <tr><th>Project</th><th>Todo</th><th>In progress</th><th>Complete</th></tr>
         </thead>
-        <tbody id="project-picker-body"
-               data-nd-bind="/v1/projects"
-               data-nd-template="project-row">
-          <template id="project-row">
-            <tr>
-              <td>{{ident}}</td>
-              <td class="nd-text-muted">{{channel_name}}</td>
-              <td>{{total_messages}}</td>
-              <td>
-                <a class="nd-btn-primary nd-btn-sm" href="/projects/{{ident}}/tasks">
-                  Open board
-                </a>
-              </td>
-            </tr>
-          </template>
-          <template data-nd-empty>
-            <tr><td colspan="4" class="nd-text-muted">No projects registered yet.</td></tr>
-          </template>
+        <tbody>
+          {rows}
         </tbody>
       </table>
     </div>
-  </section>"##;
+  </section>"##,
+        rows = rows,
+    );
 
     let html = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
