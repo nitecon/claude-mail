@@ -10,7 +10,9 @@ Group=agentic
 
 EnvironmentFile=/etc/agent-gateway/gateway.env
 
-ExecStartPre=/usr/local/bin/gateway update
+# Deploys are owned by Eventic (see .eventic.yaml + deploy/eventic-deploy.sh).
+# The unit just runs whatever binary the symlink currently resolves to — no
+# self-update on start.
 ExecStart=/usr/local/bin/gateway
 
 Restart=on-failure

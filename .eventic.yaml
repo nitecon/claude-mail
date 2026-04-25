@@ -1,0 +1,20 @@
+# Eventic CI/CD hooks for agent-gateway.
+#
+# GitHub Actions handles the cross-platform release tarball build for tag
+# pushes (.github/workflows/release.yml). Eventic (defcon2, user `eventic`,
+# full NOPASSWD sudo, member of the `agentic` group) owns the actual binary
+# build + service restart for this host. See deploy/eventic-deploy.sh for the
+# logic — this yaml just delegates so hook changes don't hit the
+# DiscoverHooks race (eventic reads .eventic.yaml BEFORE git pull, so changes
+# to this file always lag by one push; changes to the script take effect
+# immediately).
+
+hooks:
+  pre: "echo '[eventic] Event received for ${EVENTIC_REPO} ref=${EVENTIC_REF} event=${EVENTIC_EVENT} action=${EVENTIC_ACTION}'"
+
+events:
+  push:
+    post: |
+      bash deploy/eventic-deploy.sh
+    notify: "agent-gateway deploy {{.State}} for {{.Repo}} (ref: {{.PayloadField \"ref\"}}) by {{.Sender}}"
+    notify_on: [success, failure]
