@@ -697,7 +697,11 @@ pub fn list_project_task_stats(conn: &Connection) -> Result<Vec<ProjectTaskStats
          FROM projects p
          LEFT JOIN tasks t ON t.project_ident = p.ident
          GROUP BY p.ident
-         ORDER BY p.created_at DESC",
+         ORDER BY
+            COALESCE(SUM(CASE WHEN t.status = 'todo' THEN 1 ELSE 0 END), 0) DESC,
+            COALESCE(SUM(CASE WHEN t.status = 'in_progress' THEN 1 ELSE 0 END), 0) DESC,
+            COALESCE(SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END), 0) DESC,
+            p.ident ASC",
     )?;
     let projects = stmt
         .query_map([], |r| {
@@ -2457,6 +2461,54 @@ mod tests {
                 .id,
             delegation.id
         );
+    }
+
+    #[test]
+    fn project_task_stats_sort_by_active_work_counts() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("alpha")).unwrap();
+        insert_project(&conn, &test_project("bravo")).unwrap();
+        insert_project(&conn, &test_project("charlie")).unwrap();
+
+        let bravo_todo_1 =
+            insert_task(&conn, "bravo", "b1", None, None, &[], None, "tester").unwrap();
+        let bravo_todo_2 =
+            insert_task(&conn, "bravo", "b2", None, None, &[], None, "tester").unwrap();
+        let alpha_todo =
+            insert_task(&conn, "alpha", "a1", None, None, &[], None, "tester").unwrap();
+        let charlie_done =
+            insert_task(&conn, "charlie", "c1", None, None, &[], None, "tester").unwrap();
+
+        let in_progress = TaskUpdate {
+            status: Some("in_progress"),
+            owner_agent_id: None,
+            rank: None,
+            title: None,
+            description: None,
+            details: None,
+            labels: None,
+            hostname: None,
+        };
+        update_task(
+            &conn,
+            "alpha",
+            &alpha_todo.id,
+            &in_progress,
+            Some("agent-a"),
+        )
+        .unwrap();
+
+        let done = TaskUpdate {
+            status: Some("done"),
+            ..in_progress
+        };
+        update_task(&conn, "charlie", &charlie_done.id, &done, Some("agent-a")).unwrap();
+
+        let stats = list_project_task_stats(&conn).unwrap();
+        let idents = stats.into_iter().map(|s| s.ident).collect::<Vec<_>>();
+        assert_eq!(idents, vec!["bravo", "alpha", "charlie"]);
+        assert_eq!(bravo_todo_1.status, "todo");
+        assert_eq!(bravo_todo_2.status, "todo");
     }
 
     #[test]
