@@ -14,6 +14,10 @@ pub struct Project {
     /// Opaque ID of the last inbound message seen (backfill cursor).
     pub last_msg_id: Option<String>,
     pub created_at: i64,
+    pub repo_provider: Option<String>,
+    pub repo_namespace: Option<String>,
+    pub repo_name: Option<String>,
+    pub repo_full_name: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -161,6 +165,12 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         [],
     );
     migrate_messages_for_system_delivery(conn)?;
+
+    // ── Migration: optional provider-aware repository mapping for projects ───
+    let _ = conn.execute("ALTER TABLE projects ADD COLUMN repo_provider TEXT", []);
+    let _ = conn.execute("ALTER TABLE projects ADD COLUMN repo_namespace TEXT", []);
+    let _ = conn.execute("ALTER TABLE projects ADD COLUMN repo_name TEXT", []);
+    let _ = conn.execute("ALTER TABLE projects ADD COLUMN repo_full_name TEXT", []);
 
     // Migrate existing confirmed messages to agent_confirmations for "_default" agent.
     conn.execute(
@@ -402,7 +412,8 @@ pub fn set_theme(conn: &Connection, theme: &str) -> Result<()> {
 
 pub fn get_project(conn: &Connection, ident: &str) -> Result<Option<Project>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT ident, channel_name, room_id, last_msg_id, created_at
+        "SELECT ident, channel_name, room_id, last_msg_id, created_at,
+                repo_provider, repo_namespace, repo_name, repo_full_name
          FROM projects WHERE ident = ?1",
     )?;
     let mut rows = stmt.query_map(params![ident], row_to_project)?;
@@ -416,7 +427,8 @@ pub fn get_project_by_room(
     room_id: &str,
 ) -> Result<Option<Project>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT ident, channel_name, room_id, last_msg_id, created_at
+        "SELECT ident, channel_name, room_id, last_msg_id, created_at,
+                repo_provider, repo_namespace, repo_name, repo_full_name
          FROM projects WHERE channel_name = ?1 AND room_id = ?2",
     )?;
     let mut rows = stmt.query_map(params![channel_name, room_id], row_to_project)?;
@@ -425,15 +437,22 @@ pub fn get_project_by_room(
 
 pub fn insert_project(conn: &Connection, p: &Project) -> Result<()> {
     conn.execute(
-        "INSERT INTO projects (ident, channel_name, room_id, last_msg_id, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO projects (
+            ident, channel_name, room_id, last_msg_id, created_at,
+            repo_provider, repo_namespace, repo_name, repo_full_name
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(ident) DO NOTHING",
         params![
             p.ident,
             p.channel_name,
             p.room_id,
             p.last_msg_id,
-            p.created_at
+            p.created_at,
+            p.repo_provider,
+            p.repo_namespace,
+            p.repo_name,
+            p.repo_full_name
         ],
     )?;
     conn.execute(
@@ -447,7 +466,9 @@ pub fn insert_project(conn: &Connection, p: &Project) -> Result<()> {
 
 pub fn all_projects(conn: &Connection) -> Result<Vec<Project>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT ident, channel_name, room_id, last_msg_id, created_at FROM projects",
+        "SELECT ident, channel_name, room_id, last_msg_id, created_at,
+                repo_provider, repo_namespace, repo_name, repo_full_name
+         FROM projects",
     )?;
     let collected = stmt
         .query_map([], row_to_project)?
@@ -470,7 +491,61 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         room_id: row.get(2)?,
         last_msg_id: row.get(3)?,
         created_at: row.get(4)?,
+        repo_provider: row.get(5)?,
+        repo_namespace: row.get(6)?,
+        repo_name: row.get(7)?,
+        repo_full_name: row.get(8)?,
     })
+}
+
+pub fn update_project_repo_mapping(
+    conn: &Connection,
+    ident: &str,
+    provider: Option<&str>,
+    namespace: Option<&str>,
+    repo_name: Option<&str>,
+) -> Result<Option<Project>> {
+    let provider = provider.map(str::trim).filter(|s| !s.is_empty());
+    let namespace = namespace.map(str::trim).filter(|s| !s.is_empty());
+    let repo_name = repo_name.map(str::trim).filter(|s| !s.is_empty());
+    let repo_full_name = match (namespace, repo_name) {
+        (Some(ns), Some(repo)) => Some(format!("{ns}/{repo}")),
+        _ => None,
+    };
+
+    conn.execute(
+        "UPDATE projects
+         SET repo_provider = ?1,
+             repo_namespace = ?2,
+             repo_name = ?3,
+             repo_full_name = ?4
+         WHERE ident = ?5",
+        params![provider, namespace, repo_name, repo_full_name, ident],
+    )?;
+    get_project(conn, ident)
+}
+
+pub fn bulk_fill_missing_repo_mappings(
+    conn: &Connection,
+    provider: &str,
+    namespace: &str,
+) -> Result<usize> {
+    let provider = provider.trim();
+    let namespace = namespace.trim();
+    if provider.is_empty() || namespace.is_empty() {
+        return Ok(0);
+    }
+
+    let changed = conn.execute(
+        "UPDATE projects
+         SET repo_provider = ?1,
+             repo_namespace = ?2,
+             repo_name = ident,
+             repo_full_name = ?2 || '/' || ident
+         WHERE COALESCE(repo_full_name, '') = ''",
+        params![provider, namespace],
+    )?;
+    Ok(changed)
 }
 
 // ── Messages ─────────────────────────────────────────────────────────────────
@@ -635,6 +710,10 @@ pub struct ProjectStats {
     pub room_id: String,
     pub total_messages: i64,
     pub unread_count: i64,
+    pub repo_provider: Option<String>,
+    pub repo_namespace: Option<String>,
+    pub repo_name: Option<String>,
+    pub repo_full_name: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -668,7 +747,8 @@ pub fn list_project_stats(conn: &Connection) -> Result<Vec<ProjectStats>> {
                 (SELECT COUNT(*) FROM messages m2
                  WHERE m2.project_ident = p.ident
                    AND m2.confirmed_at IS NULL
-                   AND m2.source = 'user')
+                   AND m2.source = 'user'),
+                p.repo_provider, p.repo_namespace, p.repo_name, p.repo_full_name
          FROM projects p
          LEFT JOIN messages m ON m.project_ident = p.ident
          GROUP BY p.ident
@@ -682,6 +762,10 @@ pub fn list_project_stats(conn: &Connection) -> Result<Vec<ProjectStats>> {
                 room_id: r.get(2)?,
                 total_messages: r.get(3)?,
                 unread_count: r.get(4)?,
+                repo_provider: r.get(5)?,
+                repo_namespace: r.get(6)?,
+                repo_name: r.get(7)?,
+                repo_full_name: r.get(8)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2258,6 +2342,10 @@ mod tests {
             room_id: format!("room-{ident}"),
             last_msg_id: None,
             created_at: now_ms(),
+            repo_provider: None,
+            repo_namespace: None,
+            repo_name: None,
+            repo_full_name: None,
         }
     }
 

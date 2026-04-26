@@ -16,7 +16,7 @@ use axum::{
 use clap::{Parser, Subcommand};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{sync::mpsc, task::spawn_blocking};
-use tracing::info;
+use tracing::{info, warn};
 
 use channel::{ChannelPlugin, PluginEvent};
 use db::Db;
@@ -239,32 +239,47 @@ async fn main() -> Result<()> {
 
     #[cfg(feature = "discord")]
     {
-        let token = require_env("DISCORD_BOT_TOKEN");
-        let guild_id: u64 = require_env("DISCORD_GUILD_ID")
-            .parse()
-            .context("DISCORD_GUILD_ID must be a u64")?;
-        let category_id: Option<u64> = std::env::var("DISCORD_CATEGORY_ID")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.parse().context("DISCORD_CATEGORY_ID must be a u64"))
-            .transpose()?;
+        match (
+            std::env::var("DISCORD_BOT_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            std::env::var("DISCORD_GUILD_ID")
+                .ok()
+                .filter(|s| !s.is_empty()),
+        ) {
+            (Some(token), Some(guild_id_raw)) => {
+                let guild_id: u64 = guild_id_raw
+                    .parse()
+                    .context("DISCORD_GUILD_ID must be a u64")?;
+                let category_id: Option<u64> = std::env::var("DISCORD_CATEGORY_ID")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.parse().context("DISCORD_CATEGORY_ID must be a u64"))
+                    .transpose()?;
 
-        let discord = Arc::new(channels::discord::DiscordPlugin::new(
-            channels::discord::DiscordConfig {
-                token,
-                guild_id,
-                category_id,
-            },
-        ));
-        plugins.insert("discord".into(), discord);
-        info!("Registered channel plugin: discord");
+                let discord = Arc::new(channels::discord::DiscordPlugin::new(
+                    channels::discord::DiscordConfig {
+                        token,
+                        guild_id,
+                        category_id,
+                    },
+                ));
+                plugins.insert("discord".into(), discord);
+                info!("Registered channel plugin: discord");
+            }
+            _ => {
+                warn!(
+                    "Discord plugin disabled: DISCORD_BOT_TOKEN and DISCORD_GUILD_ID are not both set"
+                );
+            }
+        }
     }
 
     if plugins.is_empty() {
-        anyhow::bail!("No channel plugins enabled. Build with --features discord (or others).");
+        warn!("No channel plugins are enabled; comms send/receive is unavailable, but API/UI routes will still start");
     }
     if !plugins.contains_key(&default_channel) {
-        anyhow::bail!(
+        warn!(
             "DEFAULT_CHANNEL='{default_channel}' is not among the enabled plugins: {:?}",
             plugins.keys().collect::<Vec<_>>()
         );
@@ -395,6 +410,29 @@ async fn main() -> Result<()> {
             patch(routes::update_delegation_handler),
         )
         .route(
+            "/v1/projects/repo-mappings/bulk",
+            post(routes::bulk_update_project_repo_mappings),
+        )
+        .route(
+            "/v1/projects/{ident}/repo",
+            patch(routes::update_project_repo_mapping),
+        )
+        .route(
+            "/v1/projects/{ident}/eventic",
+            get(routes::get_project_eventic_status),
+        )
+        .route(
+            "/v1/eventic/servers",
+            get(routes::get_eventic_servers)
+                .post(routes::add_eventic_server)
+                .put(routes::replace_eventic_servers),
+        )
+        .route(
+            "/v1/eventic/servers/{id}",
+            patch(routes::update_eventic_server).delete(routes::delete_eventic_server),
+        )
+        .route("/v1/eventic/projects", get(routes::list_eventic_projects))
+        .route(
             "/v1/patterns",
             get(routes::list_patterns_handler).post(routes::create_pattern_handler),
         )
@@ -415,6 +453,7 @@ async fn main() -> Result<()> {
     // old /manage tab hub.
     let app = Router::new()
         .route("/", get(routes::dashboard))
+        .route("/projects/{ident}/build", get(routes::project_build_page))
         .route("/tasks", get(routes::tasks_picker))
         .route("/projects/{ident}/tasks", get(routes::tasks_board))
         .route("/projects/{ident}/tasks/new", get(routes::new_task_page))
@@ -428,6 +467,7 @@ async fn main() -> Result<()> {
         .route("/agents", get(routes::agents_page))
         .route("/agents/new", get(routes::new_agent_page))
         .route("/agents/{name}", get(routes::agent_detail_page))
+        .route("/settings", get(routes::settings_page))
         .route("/theme", get(routes::get_theme).post(routes::set_theme))
         .merge(api)
         .with_state(state);

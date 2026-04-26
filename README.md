@@ -64,14 +64,14 @@ Binary: `target/release/gateway`
 
 ## Prerequisites
 
-- A Discord account and server you control (for the Discord channel plugin)
 - The gateway reachable from all machines running agent clients (LAN, VPN, or public host)
+- A Discord account and server you control only if you want Discord-backed comms. Without Discord credentials, the gateway still starts and serves API/UI/Eventic routes, but channel send/receive is unavailable.
 
 ---
 
 ## Getting started
 
-### 1. Create a Discord bot
+### 1. Create a Discord bot (optional)
 
 1. Go to [discord.com/developers/applications](https://discord.com/developers/applications) and click **New Application**.
 2. Under **Bot**, click **Add Bot**.
@@ -106,8 +106,8 @@ cp crates/gateway/.env.example crates/gateway/.env
 ```
 
 ```env
-DISCORD_BOT_TOKEN=your-bot-token-here
-DISCORD_GUILD_ID=123456789012345678
+DISCORD_BOT_TOKEN=your-bot-token-here      # optional; omit to disable Discord
+DISCORD_GUILD_ID=123456789012345678       # optional; required only with DISCORD_BOT_TOKEN
 DISCORD_CATEGORY_ID=                  # optional -- leave blank for top-level channels
 GATEWAY_API_KEY=choose-a-long-random-secret
 GATEWAY_HOST=0.0.0.0
@@ -118,6 +118,8 @@ RUST_LOG=info
 ```
 
 > `GATEWAY_API_KEY` is the shared secret between the gateway and all clients. Use a long random string (e.g. `openssl rand -hex 32`).
+
+When `DISCORD_BOT_TOKEN` and `DISCORD_GUILD_ID` are not both set, the Discord plugin is skipped at startup. Existing pages and non-channel APIs still run; attempts to send through a project whose channel plugin is unavailable return `503 Service Unavailable`.
 
 ---
 
@@ -217,9 +219,33 @@ Pattern comments are intentionally opt-in. Normal pattern pulls should use
 `GET /v1/patterns/:id`; comments are collaboration/review state and should only
 be fetched when a user asks an agent to address comments on that pattern.
 
+### Eventic build status
+
+Gateway can proxy client-local Eventic build information when Eventic web
+consoles are configured under `/settings`. Projects keep their existing short
+gateway identity (for example `eventic`) and can also store provider-aware repo
+metadata (`github`, `gitlab`, `bitbucket`, etc. plus `namespace/repo`) for
+matching Eventic's `/projects` output.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/v1/eventic/servers` | List configured Eventic server entries. |
+| `POST` | `/v1/eventic/servers` | Add a server. Body: `{name, base_url, enabled}`. Defaults usually point at `http://127.0.0.1:16384`. |
+| `PUT` | `/v1/eventic/servers` | Replace the full server list. |
+| `PATCH` | `/v1/eventic/servers/:id` | Update one configured server. |
+| `DELETE` | `/v1/eventic/servers/:id` | Remove one configured server. |
+| `GET` | `/v1/eventic/projects` | Aggregate `/projects` from enabled Eventic servers. |
+| `PATCH` | `/v1/projects/:ident/repo` | Set a project's repo mapping. Body: `{provider, namespace, repo_name}`. |
+| `POST` | `/v1/projects/repo-mappings/bulk` | Fill unmapped legacy projects with one provider/namespace and `repo_name = ident`. |
+| `GET` | `/v1/projects/:ident/eventic` | Return the mapped project's current Eventic status or an actionable hint when mapping/server config is missing. |
+
 ### Dashboard
 
-`GET /` -- no auth required. HTML page showing project counts, message stats, and skill inventory.
+`GET /` -- no auth required. HTML page showing project counts, message stats, skill inventory, and build-status links for repo-mapped projects.
+
+`GET /settings` -- no auth required. HTML settings page for Eventic server configuration and bulk repository mapping.
+
+`GET /projects/:ident/build` -- no auth required. HTML build-status page backed by Eventic project output.
 
 ---
 
