@@ -1,0 +1,311 @@
+app: agent-gateway
+title: Agent Gateway API context
+summary: Agent coordination gateway for project-scoped comms, task boards, API context docs, patterns, skills, and build status.
+kind: agent_context
+source_format: agent_context
+source_ref: .agent/api/agent-gateway.yaml
+version: v1.6.0
+labels:
+  - gateway
+  - agents
+  - api-docs
+  - tasks
+  - comms
+  - patterns
+  - eventic
+content:
+  purpose: |
+    agent-gateway is the server-side coordination layer for AI agents. It stores project registration, messages, per-agent unread state, project task boards, global patterns, skills/commands/agents, Eventic build status configuration, and agent-native API docs.
+
+    Agents should use agent-gateway when they need durable cross-session coordination, cross-project delegated work, user-visible project communication, reusable organization guidance, or RAG-ready API context for owned apps.
+  auth:
+    type: bearer
+    header: "Authorization: Bearer <GATEWAY_API_KEY>"
+    agent_identity_header: X-Agent-Id
+    notes:
+      - All /v1 API routes require the bearer token.
+      - Public HTML control-panel routes do not require bearer auth.
+      - X-Agent-Id controls per-agent unread queues and actor identity on task workflows.
+  safety:
+    - name: Do not use theme endpoint for agents
+      guidance: /theme is a frontend display preference endpoint for the control panel, not an agent integration surface.
+    - name: Confirm messages after handling
+      guidance: Agents should call POST /v1/projects/:ident/messages/:id/confirm after handling each unread message so work is not repeated.
+    - name: Treat task ownership as coordination state
+      guidance: Claim tasks before working, release if abandoning, and avoid overwriting another active owner unless the task is stale and the API permits reclaim.
+    - name: Fetch pattern comments only when requested
+      guidance: Pattern comments are review/collaboration state. Normal agents should fetch pattern bodies without comments unless explicitly asked to address comments.
+    - name: API docs are agent-native
+      guidance: OpenAPI or Swagger can feed the registry, but the canonical registry entry should include workflows, intent, auth, safety, relationships, and examples.
+  relationships:
+    - app: agent-tools
+      relationship: Primary CLI client for agents. It wraps gateway comms, tasks, patterns, API docs, and setup flows.
+    - app: Eventic
+      relationship: Optional local build-status source. Gateway stores Eventic server config and project repo mappings, then proxies status to agents.
+    - app: Discord
+      relationship: Optional channel plugin for user/agent project communication. Gateway can start without Discord credentials, but channel send/receive is unavailable.
+  workflows:
+    - name: Register and communicate for a project
+      steps:
+        - POST /v1/projects with a git remote URL or project name to get the sanitized project ident.
+        - Send agent status or questions with POST /v1/projects/:ident/messages.
+        - Poll GET /v1/projects/:ident/messages/unread using a stable X-Agent-Id.
+        - Handle each user or system message once, then confirm it with POST /v1/projects/:ident/messages/:id/confirm.
+    - name: Work a project task
+      steps:
+        - GET /v1/projects/:ident/tasks to inspect todo and in_progress items.
+        - PATCH /v1/projects/:ident/tasks/:id with status in_progress to claim work.
+        - Add progress notes with POST /v1/projects/:ident/tasks/:id/comments.
+        - PATCH the task to done when complete, including status and any final detail updates.
+    - name: Delegate work to another project
+      steps:
+        - POST /v1/projects/:ident/tasks/delegate with target_project_ident, title, description, and specification.
+        - Track the source delegated task and target executable task through their task details.
+        - When the target task completes, gateway links completion state back through task_delegations and system messages.
+    - name: Publish agent API context
+      steps:
+        - Author a docs-first file such as .agent/api/<app>.yaml with app, title, metadata, and content.
+        - Include purpose, workflows, endpoints, auth, safety, relationships, examples, operations, and schemas where applicable.
+        - Validate locally with agent-tools docs validate --file PATH.
+        - Publish with agent-tools docs publish --file PATH or POST /v1/projects/:ident/api-docs.
+        - Retrieve RAG chunks with GET /v1/projects/:ident/api-docs/chunks.
+    - name: Reuse global patterns
+      steps:
+        - Search active latest patterns before implementing established practice.
+        - Fetch a pattern body with GET /v1/patterns/:id or agent-tools patterns get.
+        - Only fetch comments when the user asks to address pattern review comments.
+        - Keep .patterns in the repo aligned with patterns actually used by files.
+  endpoints:
+    - method: POST
+      path: /v1/projects
+      intent: Register a project and create or reuse its communication room.
+      request:
+        ident: Git remote URL, repository name, or directory-derived project identity.
+        channel: Optional channel plugin name. Defaults to gateway DEFAULT_CHANNEL.
+      response: "{ ident, channel_name, room_id }"
+      notes:
+        - Idempotent for an existing project ident.
+    - method: GET
+      path: /v1/projects
+      intent: List registered projects and repo mapping metadata.
+    - method: PATCH
+      path: /v1/projects/:ident/repo
+      intent: Set provider-aware repo mapping for Eventic build status matching.
+      request:
+        provider: Repository provider such as github.
+        namespace: Repository namespace or owner.
+        repo_name: Repository name.
+    - method: POST
+      path: /v1/projects/repo-mappings/bulk
+      intent: Fill missing project repo mappings from one provider/namespace using repo_name = project ident.
+    - method: POST
+      path: /v1/projects/:ident/messages
+      intent: Send an agent message to the project channel and persist it.
+      request:
+        body: Required message body. Legacy content alias is accepted.
+        subject: Optional headline. Derived from the first non-empty body line if absent.
+        hostname: Optional origin host. Defaults to X-Agent-Id.
+        event_at: Optional epoch milliseconds for agent-claimed event time.
+    - method: GET
+      path: /v1/projects/:ident/messages/unread
+      intent: Fetch unconfirmed user and deliverable system messages for the calling agent.
+      headers:
+        X-Agent-Id: Stable agent identity. Defaults to _default.
+    - method: POST
+      path: /v1/projects/:ident/messages/:id/confirm
+      intent: Mark a message as handled for the calling X-Agent-Id.
+    - method: POST
+      path: /v1/projects/:ident/messages/:id/reply
+      intent: Reply to a specific project message, preserving parent linkage when the channel plugin supports it.
+    - method: POST
+      path: /v1/projects/:ident/messages/:id/action
+      intent: Post an action notice tied to a message. Unsupplied subject is prefixed with [ACTION].
+    - method: GET
+      path: /v1/projects/:ident/tasks
+      intent: List project tasks. Supports filtering by status and labels through query params.
+    - method: POST
+      path: /v1/projects/:ident/tasks
+      intent: Create a normal project task with title, description, labels, and specification/details.
+    - method: POST
+      path: /v1/projects/:ident/tasks/delegate
+      intent: Create a delegated source task and a target executable task in another project.
+    - method: POST
+      path: /v1/projects/:ident/tasks/reorder
+      intent: Reorder tasks within a status column.
+    - method: GET
+      path: /v1/projects/:ident/tasks/:id
+      intent: Fetch task detail, comments, delegation metadata, and allowed actions.
+    - method: PATCH
+      path: /v1/projects/:ident/tasks/:id
+      intent: Update task fields, status, ownership, labels, or specification/details.
+    - method: DELETE
+      path: /v1/projects/:ident/tasks/:id
+      intent: Delete a task and dependent comments/delegation rows.
+    - method: POST
+      path: /v1/projects/:ident/tasks/:id/comments
+      intent: Append task progress or review context.
+    - method: PATCH
+      path: /v1/projects/:ident/tasks/:id/delegation
+      intent: Update delegation completion state for a delegated task.
+    - method: GET
+      path: /v1/projects/:ident/api-docs
+      intent: List agent API context summaries for a project.
+      query:
+        q: Search app, title, summary, metadata, labels, and content JSON.
+        app: Exact app filter.
+        label: Label filter.
+        kind: Kind filter, usually agent_context.
+    - method: POST
+      path: /v1/projects/:ident/api-docs
+      intent: Publish a docs-first agent API context document.
+      request:
+        app: Required app/service key.
+        title: Required display title.
+        content: Required structured JSON context.
+        summary: Optional summary.
+        kind: Optional kind, default agent_context.
+        source_format: Optional source format, default agent_context.
+        source_ref: Optional source path or external reference.
+        version: Optional version or source version.
+        labels: Optional labels array or comma-separated string.
+        author: Optional author.
+    - method: GET
+      path: /v1/projects/:ident/api-docs/chunks
+      intent: Return RAG-ready chunks generated from stored agent API context.
+    - method: GET
+      path: /v1/projects/:ident/api-docs/:id
+      intent: Fetch one full agent API context document.
+    - method: PATCH
+      path: /v1/projects/:ident/api-docs/:id
+      intent: Update API context metadata or content. Nullable fields can clear summary, source_ref, or version.
+    - method: DELETE
+      path: /v1/projects/:ident/api-docs/:id
+      intent: Delete one API context document.
+    - method: GET
+      path: /v1/patterns
+      intent: List global markdown patterns with filters q, label, version, state, and superseded_by.
+    - method: POST
+      path: /v1/patterns
+      intent: Create a global pattern with lifecycle metadata.
+    - method: GET
+      path: /v1/patterns/:id
+      intent: Fetch one pattern by id or slug without comments.
+    - method: PATCH
+      path: /v1/patterns/:id
+      intent: Update pattern body or metadata.
+    - method: DELETE
+      path: /v1/patterns/:id
+      intent: Delete a pattern and its comments.
+    - method: GET
+      path: /v1/patterns/:id/comments
+      intent: Fetch review comments for a pattern when explicitly needed.
+    - method: POST
+      path: /v1/patterns/:id/comments
+      intent: Add a pattern review/comment thread entry.
+    - method: GET
+      path: /v1/skills
+      intent: List uploaded skills, commands, and agents.
+    - method: POST
+      path: /v1/skills
+      intent: Create or update a markdown command or agent with JSON name, kind, and content. Intended for control-panel editor workflows.
+    - method: PUT
+      path: /v1/skills/:name
+      intent: Upload or replace a zipped skill.
+    - method: POST
+      path: /v1/skills/:name
+      intent: Create or update markdown command or agent content.
+    - method: GET
+      path: /v1/skills/:name
+      intent: Download a skill zip by name.
+    - method: GET
+      path: /v1/skills/:name/content
+      intent: Fetch markdown content for a command or agent.
+    - method: DELETE
+      path: /v1/skills/:name
+      intent: Delete a skill, command, or agent record.
+    - method: GET
+      path: /v1/eventic/servers
+      intent: List configured Eventic server entries.
+    - method: POST
+      path: /v1/eventic/servers
+      intent: Add an Eventic server configuration.
+    - method: PUT
+      path: /v1/eventic/servers
+      intent: Replace the entire Eventic server list.
+    - method: PATCH
+      path: /v1/eventic/servers/:id
+      intent: Update one Eventic server configuration.
+    - method: DELETE
+      path: /v1/eventic/servers/:id
+      intent: Remove an Eventic server configuration.
+    - method: GET
+      path: /v1/eventic/projects
+      intent: Aggregate project names from enabled Eventic servers.
+    - method: GET
+      path: /v1/projects/:ident/eventic
+      intent: Return mapped project Eventic build status or actionable setup hints.
+    - method: GET
+      path: /theme
+      intent: Frontend-only control-panel display preference. Not intended for agents.
+    - method: POST
+      path: /theme
+      intent: Frontend-only theme update. Not intended for agents.
+  examples:
+    - name: Register project
+      request:
+        method: POST
+        path: /v1/projects
+        body:
+          ident: "git@github.com:nitecon/agent-gateway.git"
+          channel: discord
+      response:
+        ident: agent-gateway
+        channel_name: discord
+        room_id: "opaque-channel-id"
+    - name: Send message and confirm reply
+      sequence:
+        - "POST /v1/projects/agent-gateway/messages with body and optional subject."
+        - "GET /v1/projects/agent-gateway/messages/unread with X-Agent-Id."
+        - "POST /v1/projects/agent-gateway/messages/<id>/confirm after handling."
+    - name: Publish API context
+      command: "agent-tools docs validate --file .agent/api/agent-gateway.yaml && agent-tools docs publish --file .agent/api/agent-gateway.yaml"
+    - name: Search API context
+      command: "agent-tools docs search \"delegate task\" --project agent-gateway"
+  operations:
+    - name: Startup without Discord
+      guidance: Gateway starts and serves API/UI/Eventic routes when Discord credentials are absent. Channel send/receive is unavailable for projects using missing channel plugins.
+    - name: Release versioning
+      guidance: Main source manifests use source-build versioning; release version is anchored by git tags such as v1.6.0.
+    - name: Database
+      guidance: SQLite schema is applied at startup through idempotent migrations in db::apply_schema.
+  schemas:
+    message_envelope:
+      required:
+        - body
+      fields:
+        body: Required message text.
+        subject: Optional headline.
+        hostname: Optional origin host.
+        event_at: Optional epoch milliseconds.
+    api_doc_publish:
+      required:
+        - app
+        - title
+        - content
+      fields:
+        app: App/service identifier.
+        title: Human readable title.
+        content: Structured agent-native context JSON.
+        labels: Array or comma-separated string.
+    task:
+      key_fields:
+        - id
+        - project_ident
+        - title
+        - description
+        - details
+        - specification
+        - status
+        - owner_agent_id
+        - labels
+        - kind
